@@ -13,10 +13,11 @@ import numpy as np
 
 # class that shedules request of astra-sim
 class Scheduler:
-    def __init__(self, model, node_id, instance_id, max_batch, max_num_batched_tokens, 
-                 npu_num, npu_group, npu_mem, cpu_mem, 
-                 start_npu, pd_type, fp, block_size, req_num, 
-                 prioritize_prefill, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0):
+    def __init__(self, model, node_id, instance_id, max_batch, max_num_batched_tokens,
+                 npu_num, npu_group, npu_mem, cpu_mem,
+                 start_npu, pd_type, fp, block_size, req_num,
+                 prioritize_prefill, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0,
+                 hbf_mem=0, enable_hbf_offloading=False):
         # all time realated variables are in using tick (system tick)
         # LLMServingSim uses Orca, vLLM technique at deafult
         self.model = model
@@ -43,7 +44,8 @@ class Scheduler:
         self.first_arrival_time = 0
 
         # memory model
-        self.memory = MemoryModel(model, instance_id, node_id, npu_num, npu_group, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem)
+        self.memory = MemoryModel(model, instance_id, node_id, npu_num, npu_group, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem,
+                                  hbf_mem, enable_hbf_offloading)
 
         # logger
         self.logger = get_logger(self.__class__, node_id=node_id, instance_id=instance_id)
@@ -97,13 +99,13 @@ class Scheduler:
                 if self.memory.is_avail(kv_size, Device.NPU):
                     temp_len = i
                     break
-            
+
             # no memory to batch
             while temp_len == 0:
                 # preempt request one by one untill there is enough space
                 if len(gen_req) == 0:
                     return None
-                
+
                 # check already evicted request
                 if gen_req[-1].evict:
                     gen_req = gen_req[:-1]
@@ -168,7 +170,7 @@ class Scheduler:
             # Allocate Needed KV caches for current batch
             if kv_size > 0:
                 self.memory.allocate(kv_size, Device.NPU)
-            
+
             # load memory from cpu (host)
             if load_size > 0:
                 self.memory.free(load_size, Device.CPU)

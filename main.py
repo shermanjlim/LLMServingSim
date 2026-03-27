@@ -44,6 +44,7 @@ def main():
     parser.add_argument('--prefix-storage', type=str, choices=['None', 'CPU', 'CXL'], help='storage medium for second-tier prefix caching system', default='None')
     parser.add_argument('--enable-local-offloading', action='store_true', help="enable weight offloading to local (NPU) memory "
                         "(recommended to *disable* unless weight memory access is not counted in profiling)", default=False)
+    parser.add_argument('--enable-hbf-offloading', action='store_true', help="enable weight offloading to HBF memory", default=False)
     parser.add_argument('--enable-attn-offloading', action='store_true', help="enable attention offloading to PIM", default=False)
     parser.add_argument('--enable-sub-batch-interleaving', action='store_true', help="enable sub-batch interleaving for better resource utilization", default=False)
     parser.add_argument('--enable-attn-prediction', action='store_true', help="enable realtime attention prediction", default=False)
@@ -77,6 +78,7 @@ def main():
     enable_prefix_sharing=args.enable_prefix_sharing
     prefix_storage=args.prefix_storage
     enable_local_offloading=args.enable_local_offloading
+    enable_hbf_offloading=args.enable_hbf_offloading
     enable_attn_offloading=args.enable_attn_offloading
     enable_sub_batch_interleaving=args.enable_sub_batch_interleaving
     if not enable_attn_offloading and enable_sub_batch_interleaving:
@@ -94,7 +96,7 @@ def main():
     log_interval=args.log_interval
     network_backend = args.network_backend
     # ---------------------------------- Extract cluster config -----------------------------------
-    cluster = build_cluster_config(astra_sim, args.cluster_config, args.enable_local_offloading, args.enable_attn_offloading)
+    cluster = build_cluster_config(astra_sim, args.cluster_config, args.enable_local_offloading, args.enable_attn_offloading, enable_hbf_offloading)
     num_nodes = cluster["num_nodes"]
     num_instances = cluster["num_instances"]
     instances = cluster["instances"]
@@ -199,8 +201,9 @@ def main():
         schedulers.append(Scheduler(
             instance["model_name"], instance["node_id"], instance_id, max_batch, max_num_batched_tokens,
             instance["npu_num"], instance["npu_group"], instance["npu_mem"]["mem_size"], cpu_mem_size[instance["node_id"]],
-            inst2npu_mapping[instance_id], instance["pd_type"], fp, block_size, num_req, 
-            prioritize_prefill, enable_prefix_caching, enable_prefix_sharing, prefix_pool, pool_device, cxl_mem
+            inst2npu_mapping[instance_id], instance["pd_type"], fp, block_size, num_req,
+            prioritize_prefill, enable_prefix_caching, enable_prefix_sharing, prefix_pool, pool_device, cxl_mem,
+            cluster["hbf_mem_size"], enable_hbf_offloading
         ))
 
     # Controller for astra-sim process communication

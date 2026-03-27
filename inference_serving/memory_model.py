@@ -14,7 +14,8 @@ class Device(Enum):
     CXL = 3
 
 class MemoryModel():
-    def __init__(self, model, instance_id, node_id, npu_num, npu_group, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0):
+    def __init__(self, model, instance_id, node_id, npu_num, npu_group, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0,
+                 hbf_mem=0, enable_hbf_offloading=False):
         self.model = model
         self.node_id = node_id
         self.instance_id = instance_id
@@ -29,6 +30,9 @@ class MemoryModel():
         self.enable_prefix_caching = enable_prefix_caching
         self.enable_prefix_sharing = enable_prefix_sharing
         self.prefix_storage = prefix_storage
+
+        self.hbf_mem = hbf_mem * GB_TO_BYTE
+        self.enable_hbf_offloading = enable_hbf_offloading        
 
         self.config = get_config(model)
         self.n_embd = self.config['hidden_size']
@@ -45,14 +49,23 @@ class MemoryModel():
 
         # Memory model
         self.weight = self.get_weight() # assume weight is loaded
-        self.npu_used = self.weight
         self.cpu_used = 0
-        if self.weight > self.npu_mem:
-            raise RuntimeError(f"[MemoryModel] [node={self.node_id},inst={self.instance_id}]: Model size {self.weight*self.npu_num//GB_TO_BYTE}GB exceeds total NPU memory {self.npu_mem*self.npu_num//GB_TO_BYTE}GB")
+
+        if enable_hbf_offloading:
+            self.npu_used = 0
+            self.hbf_used = self.weight
+            if self.weight > self.hbf_mem:
+                raise RuntimeError(f"[MemoryModel] [node={self.node_id},inst={self.instance_id}]: Model size {self.weight*self.npu_num//GB_TO_BYTE}GB exceeds total HBF memory {self.hbf_mem*self.npu_num//GB_TO_BYTE}GB")
+        else:
+            self.npu_used = self.weight
+            self.hbf_used = 0
+            if self.weight > self.npu_mem:
+                raise RuntimeError(f"[MemoryModel] [node={self.node_id},inst={self.instance_id}]: Model size {self.weight*self.npu_num//GB_TO_BYTE}GB exceeds total NPU memory {self.npu_mem*self.npu_num//GB_TO_BYTE}GB")
+        self.npu_min = self.npu_used
 
         if enable_prefix_caching:
             one_token_kv_size = self.get_kv(1)
-            self.mem_for_kv = self.npu_mem - self.weight
+            self.mem_for_kv = self.npu_mem - self.npu_used
             self.npu_prefix_cache = RadixCache(device='NPU', 
                                                node_id=self.node_id,
                                                instance_id=self.instance_id,
@@ -196,21 +209,35 @@ class MemoryModel():
         return evict_size
 
     def free_weight(self):
-        if self.npu_used - self.weight < 0:
-            raise RuntimeError(
-                f"[MemoryModel] [node={self.node_id}, inst={self.instance_id}] NPU: tried to free model weight {self.weight / MB_TO_BYTE:.2f}MB "
-                f"but only {self.npu_used / MB_TO_BYTE:.2f}MB is used."
+        if self.enable_hbf_offloading:
+            if self.hbf_used - self.weight < 0:
+                raise RuntimeError(
+                    f"[MemoryModel] [node={self.node_id},inst={self.instance_id}] HBF: tried to free model weight {self.weight / MB_TO_BYTE:.2f}MB "
+                    f"but only {self.hbf_used / MB_TO_BYTE:.2f}MB is used."
+                )
+            self.logger.info(
+                "HBF: used: %.2fMB remove: %.2fMB after: %.2fMB",
+                self.hbf_used / MB_TO_BYTE,
+                self.weight / MB_TO_BYTE,
+                (self.hbf_used - self.weight) / MB_TO_BYTE,
             )
-        self.logger.info(
-            "NPU: used: %.2fMB remove: %.2fMB after: %.2fMB",
-            self.npu_used / MB_TO_BYTE,
-            self.weight / MB_TO_BYTE,
-            (self.npu_used - self.weight) / MB_TO_BYTE,
-        )
-        self.npu_used -= self.weight
+            self.hbf_used -= self.weight
+        else:
+            if self.npu_used - self.weight < 0:
+                raise RuntimeError(
+                    f"[MemoryModel] [node={self.node_id}, inst={self.instance_id}] NPU: tried to free model weight {self.weight / MB_TO_BYTE:.2f}MB "
+                    f"but only {self.npu_used / MB_TO_BYTE:.2f}MB is used."
+                )
+            self.logger.info(
+                "NPU: used: %.2fMB remove: %.2fMB after: %.2fMB",
+                self.npu_used / MB_TO_BYTE,
+                self.weight / MB_TO_BYTE,
+                (self.npu_used - self.weight) / MB_TO_BYTE,
+            )
+            self.npu_used -= self.weight
 
     def is_free(self):
-        return self.npu_used == 0 and self.cpu_used == 0
+        return self.npu_used == 0 and self.cpu_used == 0 and self.hbf_used == 0
 
     # -------------------- Memory Management --------------------
     
@@ -250,9 +277,9 @@ class MemoryModel():
     
     def free(self, size, device):
         if device == Device.NPU:
-            if self.npu_used - size < self.weight:
+            if self.npu_used - size < self.npu_min:
                 raise RuntimeError(
-                    f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] NPU: tried to free {size / MB_TO_BYTE:.2f}MB but only {(self.npu_used - self.weight) / MB_TO_BYTE:.2f}MB is used."
+                    f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] NPU: tried to free {size / MB_TO_BYTE:.2f}MB but only {(self.npu_used - self.npu_min) / MB_TO_BYTE:.2f}MB is used."
                 )
             self.logger.info(
                 "NPU: used: %.2fMB remove: %.2fMB after: %.2fMB",
@@ -301,7 +328,7 @@ class MemoryModel():
             return self.second_tier_prefix_cache.is_avail(size)
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to check available size of unsupported device {device}")
-    
+
     def need_size(self, size, device):
         if device == Device.NPU:
             needed = (size - (self.npu_mem - self.npu_used))

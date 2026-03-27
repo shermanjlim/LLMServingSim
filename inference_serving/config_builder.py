@@ -17,7 +17,7 @@ yaml.add_representer(FlowStyleList, represent_flowstyle_list)
 logger = get_logger("ConfigBuilder")
 
 # parse cluster configuration from JSON file and build config file for astra-sim
-def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading=False, enable_attn_offloading=False):
+def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading=False, enable_attn_offloading=False, enable_hbf_offloading=False):
     cluster_config_path = f'../{cluster_config_path}' # move out from astra-sim folder
     
     try:
@@ -64,6 +64,32 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
             "num-devices": cxl.get("num_devices", 1)
         }
         cxl_mem_size = cxl["mem_size"]
+
+    hbf_mem_size = 0
+    if "hbf_mem" in cluster_config:
+        if not (
+            num_nodes == 1 
+            and nodes[0]["num_instances"] == 1
+            and not enable_attn_offloading
+        ):
+            raise ValueError("HBF is only supported with single node & single instance and attn offloading off")
+
+        hbf = cluster_config["hbf_mem"]
+        for key in mem_required_keys:
+            if key not in hbf:
+                raise KeyError(f"Missing required key '{key}' in 'hbf_mem' configuration.")
+        memory_config["hbf_mem"] = {
+            "memory-type": "PER_NPU_MEMORY_EXPANSION",
+            "mem-bw": hbf["mem_bw"],
+            "mem-latency": hbf["mem_latency"]
+        }
+        hbf_mem_size = hbf["mem_size"]
+
+    # validation for enable_hbf_offloading
+    if enable_hbf_offloading and enable_local_offloading:
+        raise ValueError("both enable_hbf_offloading and enable_local_offloading are enabled")
+    if enable_hbf_offloading and hbf_mem_size == 0:
+        raise ValueError("there must be hbf memory if enable_hbf_offloading is true")
 
     # Check if all required arguments are present in each node
     required_keys = ["num_instances", "cpu_mem", "instances"]
@@ -314,6 +340,11 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
             d_kv     = _mem_str(default_cfg.get("kv_loc", "npu"), node_id)
             d_evict  = _mem_str(default_cfg.get("kv_evict_loc", "cpu"), node_id)
 
+            # HBF hack: default all weights to be placed on HBF when enable_hbf_offloading
+            if enable_hbf_offloading and placement_cfg != {}:
+                raise ValueError("cannot specify placement if we are doing enable_hbf_offloading")
+            d_weights = _mem_str("hbf", node_id) if enable_hbf_offloading else d_weights
+
             # Seed defaults
             block = []
             layer = {}
@@ -396,6 +427,7 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
         "total_npu": total_npu,
         "cpu_mem_size": cpu_mem_size,
         "cxl_mem_size": cxl_mem_size,
+        "hbf_mem_size": hbf_mem_size,
         "power_modeling": power_modeling,
         "power_configs": power_configs,
         "pim_models": pim_models
@@ -553,6 +585,8 @@ def _mem_str(loc, node_id):
     elif loc.upper().startswith("CPU"):
         return f"REMOTE:{node_id}"
     elif loc.upper().startswith("CXL"):
+        return loc.upper()
+    elif loc.upper().startswith("HBF"):
         return loc.upper()
     else:
         raise ValueError(f"Unknown memory placement name '{loc}'")
