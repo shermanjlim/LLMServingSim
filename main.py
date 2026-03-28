@@ -45,6 +45,7 @@ def main():
     parser.add_argument('--enable-local-offloading', action='store_true', help="enable weight offloading to local (NPU) memory "
                         "(recommended to *disable* unless weight memory access is not counted in profiling)", default=False)
     parser.add_argument('--enable-hbf-offloading', action='store_true', help="enable weight offloading to HBF memory", default=False)
+    parser.add_argument('--enable-hbf-kv', action='store_true', help="enable KV cache overflow to HBF memory", default=False)
     parser.add_argument('--enable-attn-offloading', action='store_true', help="enable attention offloading to PIM", default=False)
     parser.add_argument('--enable-sub-batch-interleaving', action='store_true', help="enable sub-batch interleaving for better resource utilization", default=False)
     parser.add_argument('--enable-attn-prediction', action='store_true', help="enable realtime attention prediction", default=False)
@@ -79,6 +80,7 @@ def main():
     prefix_storage=args.prefix_storage
     enable_local_offloading=args.enable_local_offloading
     enable_hbf_offloading=args.enable_hbf_offloading
+    enable_hbf_kv=args.enable_hbf_kv
     enable_attn_offloading=args.enable_attn_offloading
     enable_sub_batch_interleaving=args.enable_sub_batch_interleaving
     if not enable_attn_offloading and enable_sub_batch_interleaving:
@@ -96,7 +98,7 @@ def main():
     log_interval=args.log_interval
     network_backend = args.network_backend
     # ---------------------------------- Extract cluster config -----------------------------------
-    cluster = build_cluster_config(astra_sim, args.cluster_config, args.enable_local_offloading, args.enable_attn_offloading, enable_hbf_offloading)
+    cluster = build_cluster_config(astra_sim, args.cluster_config, args.enable_local_offloading, args.enable_attn_offloading, enable_hbf_offloading, enable_hbf_kv)
     num_nodes = cluster["num_nodes"]
     num_instances = cluster["num_instances"]
     instances = cluster["instances"]
@@ -203,7 +205,7 @@ def main():
             instance["npu_num"], instance["npu_group"], instance["npu_mem"]["mem_size"], cpu_mem_size[instance["node_id"]],
             inst2npu_mapping[instance_id], instance["pd_type"], fp, block_size, num_req,
             prioritize_prefill, enable_prefix_caching, enable_prefix_sharing, prefix_pool, pool_device, cxl_mem,
-            cluster["hbf_mem_size"], enable_hbf_offloading
+            cluster["hbf_mem_size"], enable_hbf_offloading, enable_hbf_kv
         ))
 
     # Controller for astra-sim process communication
@@ -358,6 +360,10 @@ def main():
             
                 print(f"{log_indent+tree_indent}Running Instance[{inst_id}]: {running_reqs} reqs,", end=' ')
                 print(f"Total # {schedulers[inst_id].npu_num} NPUs, Each NPU Memory Usage {npu_used_mb:.2f} MB ({npu_util:.3f} % Used)", end='')
+                if mem.hbf_mem > 0:
+                    hbf_used_mb = mem.hbf_used / MB_TO_BYTE
+                    hbf_util = (mem.hbf_used / mem.hbf_mem * 100.0)
+                    print(f", HBF Memory Usage {hbf_used_mb:.2f} MB ({hbf_util:.3f} % Used)", end='')
                 if enable_prefix_caching:
                     schedulers[inst_id].memory.npu_prefix_cache.print_prefix_info()
                 print()
@@ -519,6 +525,20 @@ def main():
         # Each node results
         power_model.print_power_summary()
         print(f"Power per {1/RATIO} sec (W): {power_model.power_time_series}")
+        print(SINGLE_BAR)
+    # HBF write statistics
+    if enable_hbf_offloading or enable_hbf_kv:
+        print(magenta(center("HBF Write Statistics")))
+        print(SINGLE_BAR)
+        total_hbf_writes = 0
+        total_hbf_write_bytes = 0
+        for i in range(num_instances):
+            mem = schedulers[i].memory
+            total_hbf_writes += mem.hbf_write_count
+            total_hbf_write_bytes += mem.hbf_write_bytes
+            print(f"Instance [{i}] HBF writes: {mem.hbf_write_count}, Total bytes written: {mem.hbf_write_bytes / MB_TO_BYTE:.2f} MB")
+        print(f"Total HBF writes (all instances):                                   {total_hbf_writes}")
+        print(f"Total HBF bytes written (all instances):                            {total_hbf_write_bytes / MB_TO_BYTE:.2f} MB")
         print(SINGLE_BAR)
     # Each instacne results
     for i in range(num_instances):

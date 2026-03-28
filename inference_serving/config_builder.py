@@ -17,7 +17,7 @@ yaml.add_representer(FlowStyleList, represent_flowstyle_list)
 logger = get_logger("ConfigBuilder")
 
 # parse cluster configuration from JSON file and build config file for astra-sim
-def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading=False, enable_attn_offloading=False, enable_hbf_offloading=False):
+def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading=False, enable_attn_offloading=False, enable_hbf_offloading=False, enable_hbf_kv=False):
     cluster_config_path = f'../{cluster_config_path}' # move out from astra-sim folder
     
     try:
@@ -90,6 +90,9 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
         raise ValueError("both enable_hbf_offloading and enable_local_offloading are enabled")
     if enable_hbf_offloading and hbf_mem_size == 0:
         raise ValueError("there must be hbf memory if enable_hbf_offloading is true")
+    # validation for enable_hbf_kv
+    if enable_hbf_kv and hbf_mem_size == 0:
+        raise ValueError("there must be hbf memory if enable_hbf_kv is true")
 
     # Check if all required arguments are present in each node
     required_keys = ["num_instances", "cpu_mem", "instances"]

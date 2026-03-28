@@ -157,6 +157,8 @@ def _synthesize_trace(hardware, model, config, npu_num, npu_group, pd_type, node
     kv_len = batch.kv_len
     # length of effective input when prefix hit
     hit_len = batch.hit_len
+    # total KV sequence length on HBF (for decode requests)
+    hbf_kv_len = batch.hbf_kv_len
     lm_head_len = len(batch.requests)
     req_ids = [req.id for req in batch.requests]
 
@@ -330,7 +332,17 @@ def _synthesize_trace(hardware, model, config, npu_num, npu_group, pd_type, node
 
                     attn_latency_ns =  prefill_attn_latency + decode_attn_latency
 
-                block_res.append(formatter("attn", str(attn_latency_ns), 'LOCAL', str(attn_input), get_device(placement, layer_num, "attn", "weights"), str(attn_weight), 'LOCAL', str(attn_output), 'NONE', '0', 'NONE'))
+                # HBF KV cache: move HBF portion from input to weight field
+                if hbf_kv_len > 0:
+                    hbf_kv_per_layer = (kv_head // npus_per_group) * hbf_kv_len * head_dim * fp * 2
+                    attn_input -= hbf_kv_per_layer
+                    attn_weight_loc = 'HBF:0'
+                    attn_weight_size = hbf_kv_per_layer
+                else:
+                    attn_weight_loc = get_device(placement, layer_num, "attn", "weights")
+                    attn_weight_size = attn_weight
+
+                block_res.append(formatter("attn", str(attn_latency_ns), 'LOCAL', str(attn_input), attn_weight_loc, str(attn_weight_size), 'LOCAL', str(attn_output), 'NONE', '0', 'NONE'))
 
                 if power_model is not None:
                     latency_power_list.append(attn_latency_ns)

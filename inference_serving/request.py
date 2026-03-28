@@ -29,6 +29,10 @@ class Request:
         # self.cpu_last_node = None
         self.storage_last_node = None
 
+        # hbf
+        self.npu_kv_blocks = 0
+        self.hbf_kv_blocks = 0        
+
     # to print the request information
     def __str__(self):
         return str(self.__dict__) 
@@ -61,7 +65,7 @@ class Request:
 
 # class that manages batch of astra-sim
 class Batch:
-    def __init__(self, batch_id, model, total_len, kv_len, hit_len, q_list, k_list, num_prefill, num_decode, prefill_q_list, prefill_k_list, decode_k_list, batch_time, kv_size, evict=0, load=0):
+    def __init__(self, batch_id, model, total_len, kv_len, hit_len, q_list, k_list, num_prefill, num_decode, prefill_q_list, prefill_k_list, decode_k_list, batch_time, kv_size, evict=0, load=0, hbf_kv_len=0):
         self.batch_id = batch_id
         self.model = model
         self.total_len = total_len
@@ -83,3 +87,5 @@ class Batch:
         self.prefill_q_list = prefill_q_list
         self.prefill_k_list = prefill_k_list
         self.decode_k_list = decode_k_list
+        # hbf
+        self.hbf_kv_len = hbf_kv_len

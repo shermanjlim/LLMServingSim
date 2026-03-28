@@ -12,10 +12,11 @@ class Device(Enum):
     NPU = 1
     CPU = 2
     CXL = 3
+    HBF = 4
 
 class MemoryModel():
     def __init__(self, model, instance_id, node_id, npu_num, npu_group, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0,
-                 hbf_mem=0, enable_hbf_offloading=False):
+                 hbf_mem=0, enable_hbf_offloading=False, enable_hbf_kv=False):
         self.model = model
         self.node_id = node_id
         self.instance_id = instance_id
@@ -32,7 +33,8 @@ class MemoryModel():
         self.prefix_storage = prefix_storage
 
         self.hbf_mem = hbf_mem * GB_TO_BYTE
-        self.enable_hbf_offloading = enable_hbf_offloading        
+        self.enable_hbf_offloading = enable_hbf_offloading
+        self.enable_hbf_kv = enable_hbf_kv
 
         self.config = get_config(model)
         self.n_embd = self.config['hidden_size']
@@ -61,11 +63,19 @@ class MemoryModel():
             self.hbf_used = 0
             if self.weight > self.npu_mem:
                 raise RuntimeError(f"[MemoryModel] [node={self.node_id},inst={self.instance_id}]: Model size {self.weight*self.npu_num//GB_TO_BYTE}GB exceeds total NPU memory {self.npu_mem*self.npu_num//GB_TO_BYTE}GB")
-        self.npu_min = self.npu_used
+        self.npu_floor = self.npu_used
+        self.hbf_floor = self.hbf_used
+
+        # Track HBF write statistics
+        self.hbf_write_count = 0
+        self.hbf_write_bytes = 0
+        # don't count weights write for enable_hbf_offloading
 
         if enable_prefix_caching:
             one_token_kv_size = self.get_kv(1)
             self.mem_for_kv = self.npu_mem - self.npu_used
+            if enable_hbf_kv:
+                self.mem_for_kv += (self.hbf_mem - self.hbf_used)
             self.npu_prefix_cache = RadixCache(device='NPU', 
                                                node_id=self.node_id,
                                                instance_id=self.instance_id,
@@ -100,6 +110,7 @@ class MemoryModel():
         # Hash id -> token length for corresponding prefix cache block
         self._npu_cache_hashtolen = {}
         self._cpu_cache_hashtolen = {}
+        self._block_hash_to_device = {}  # hash -> Device for HBF KV overflow tracking
         self._bytes_per_token = self.get_kv(1)  # bytes per token for kv cache
     # get weight of the model 
     def get_weight(self):
@@ -272,14 +283,30 @@ class MemoryModel():
                 self.cpu_used += size
         elif device == Device.CXL:
             self.second_tier_prefix_cache.allocate(size)
+        elif device == Device.HBF:
+            if self.hbf_used + size > self.hbf_mem:
+                raise RuntimeError(
+                    f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] HBF: tried to load {size / MB_TO_BYTE:.2f}MB "
+                    f"but only {(self.hbf_mem - self.hbf_used) / MB_TO_BYTE:.2f}MB is available."
+                )
+            self.logger.info(
+                "HBF: used: %.2fMB load: %.2fMB after: %.2fMB",
+                self.hbf_used / MB_TO_BYTE,
+                size / MB_TO_BYTE,
+                (self.hbf_used + size) / MB_TO_BYTE,
+            )
+            self.hbf_used += size
+            # writes tracking
+            self.hbf_write_count += 1
+            self.hbf_write_bytes += size
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to allocate KV cache in unsupported device {device}")
     
     def free(self, size, device):
         if device == Device.NPU:
-            if self.npu_used - size < self.npu_min:
+            if self.npu_used - size < self.npu_floor:
                 raise RuntimeError(
-                    f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] NPU: tried to free {size / MB_TO_BYTE:.2f}MB but only {(self.npu_used - self.npu_min) / MB_TO_BYTE:.2f}MB is used."
+                    f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] NPU: tried to free {size / MB_TO_BYTE:.2f}MB but only {(self.npu_used - self.npu_floor) / MB_TO_BYTE:.2f}MB is used."
                 )
             self.logger.info(
                 "NPU: used: %.2fMB remove: %.2fMB after: %.2fMB",
@@ -307,6 +334,19 @@ class MemoryModel():
                 self.cpu_used -= size
         elif device == Device.CXL:
             self.second_tier_prefix_cache.free(size)
+        elif device == Device.HBF:
+            if self.hbf_used - size < self.hbf_floor:
+                raise RuntimeError(
+                    f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] HBF: tried to free {size / MB_TO_BYTE:.2f}MB "
+                    f"but only {(self.hbf_used - self.hbf_floor) / MB_TO_BYTE:.2f}MB is freeable."
+                )
+            self.logger.info(
+                "HBF: used: %.2fMB remove: %.2fMB after: %.2fMB",
+                self.hbf_used / MB_TO_BYTE,
+                size / MB_TO_BYTE,
+                (self.hbf_used - size) / MB_TO_BYTE,
+            )
+            self.hbf_used -= size
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to free KV cache in unsupported device {device}")
     
@@ -326,6 +366,8 @@ class MemoryModel():
                     return False 
         elif device == Device.CXL:
             return self.second_tier_prefix_cache.is_avail(size)
+        elif device == Device.HBF:
+            return self.hbf_mem - self.hbf_used >= size
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to check available size of unsupported device {device}")
 
@@ -347,6 +389,9 @@ class MemoryModel():
                     return 0
         elif device == Device.CXL:
             return self.second_tier_prefix_cache.need_size(size)
+        elif device == Device.HBF:
+            needed = size - (self.hbf_mem - self.hbf_used)
+            return max(0, needed)
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to check available size of unsupported device {device}")
 
@@ -512,7 +557,16 @@ class MemoryModel():
         if not self.enable_prefix_caching:
             return
         # free evictable prefix cache, if evictable_size != total_size there is locked prefix cache
-        self.free(self.npu_prefix_cache.evictable_size() * self._bytes_per_token, Device.NPU)
+        if self.enable_hbf_kv:
+            # With HBF KV, prefix cache spans NPU and HBF; free each device's portion
+            npu_prefix_bytes = self.npu_used - self.npu_floor
+            if npu_prefix_bytes > 0:
+                self.free(npu_prefix_bytes, Device.NPU)
+            hbf_prefix_bytes = self.hbf_used - self.hbf_floor
+            if hbf_prefix_bytes > 0:
+                self.free(hbf_prefix_bytes, Device.HBF)
+        else:
+            self.free(self.npu_prefix_cache.evictable_size() * self._bytes_per_token, Device.NPU)
         if not self.enable_prefix_sharing and self.prefix_storage is not None:
             self.free(self.second_tier_prefix_cache.evictable_size() * self._bytes_per_token * self.npu_num, self.prefix_storage)
     
@@ -522,25 +576,56 @@ class MemoryModel():
         #     return
         npu_byte_alloc = 0
         npu_byte_free = 0
+        hbf_byte_alloc = 0
+        hbf_byte_free = 0
         cpu_byte_alloc = 0
         cpu_byte_free = 0
         for ev in self.npu_prefix_cache.take_events():
+            # it's always 1. Unsure why it's a list.
+            assert len(ev.block_hashes) == 1
+
             if isinstance(ev, BlockStored):
                 tlen = len(ev.token_ids)
                 for h in ev.block_hashes:
                     self._npu_cache_hashtolen[h] = tlen
-                npu_byte_alloc += self.get_kv(tlen)
+                kv_bytes = self.get_kv(tlen)
+                # TODO: improve HBF allocation policy
+                if self.enable_hbf_kv:
+                    npu_free = self.npu_mem - self.npu_used - (npu_byte_alloc - npu_byte_free)
+                    if kv_bytes <= npu_free:
+                        npu_byte_alloc += kv_bytes
+                        for h in ev.block_hashes:
+                            self._block_hash_to_device[h] = Device.NPU
+                    else:
+                        hbf_byte_alloc += kv_bytes
+                        for h in ev.block_hashes:
+                            self._block_hash_to_device[h] = Device.HBF
+                else:
+                    npu_byte_alloc += kv_bytes
             elif isinstance(ev, BlockRemoved):
                 for h in ev.block_hashes:
                     tlen = self._npu_cache_hashtolen.pop(h, 0)
                     if tlen == 0:
                         self.logger.warning("NPU prefix cache remove unknown block hash {h}")
-                    npu_byte_free += self.get_kv(tlen)
-        
+                        continue
+                    kv_bytes = self.get_kv(tlen)
+                    if self.enable_hbf_kv:
+                        device = self._block_hash_to_device.pop(h)
+                        if device == Device.HBF:
+                            hbf_byte_free += kv_bytes
+                        else:
+                            npu_byte_free += kv_bytes
+                    else:
+                        npu_byte_free += kv_bytes
+
         if npu_byte_alloc > 0:
             self.allocate(npu_byte_alloc, Device.NPU)
         if npu_byte_free > 0:
             self.free(npu_byte_free, Device.NPU)
+        if hbf_byte_alloc > 0:
+            self.allocate(hbf_byte_alloc, Device.HBF)
+        if hbf_byte_free > 0:
+            self.free(hbf_byte_free, Device.HBF)
 
         if not self.enable_prefix_sharing and self.prefix_storage is Device.CPU:
             for ev in self.second_tier_prefix_cache.take_events():

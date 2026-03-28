@@ -17,7 +17,7 @@ class Scheduler:
                  npu_num, npu_group, npu_mem, cpu_mem,
                  start_npu, pd_type, fp, block_size, req_num,
                  prioritize_prefill, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0,
-                 hbf_mem=0, enable_hbf_offloading=False):
+                 hbf_mem=0, enable_hbf_offloading=False, enable_hbf_kv=False):
         # all time realated variables are in using tick (system tick)
         # LLMServingSim uses Orca, vLLM technique at deafult
         self.model = model
@@ -35,6 +35,7 @@ class Scheduler:
         self.enable_prefix_sharing = enable_prefix_sharing
         self.prefix_storage = prefix_storage
         self.prioritize_prefill = prioritize_prefill
+        self.enable_hbf_kv = enable_hbf_kv
         # lists are sorted in arrival time manner
         self.request = [] # list of requests
         self.inflight = [] # list of batches
@@ -45,7 +46,7 @@ class Scheduler:
 
         # memory model
         self.memory = MemoryModel(model, instance_id, node_id, npu_num, npu_group, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem,
-                                  hbf_mem, enable_hbf_offloading)
+                                  hbf_mem, enable_hbf_offloading, enable_hbf_kv)
 
         # logger
         self.logger = get_logger(self.__class__, node_id=node_id, instance_id=instance_id)
@@ -96,7 +97,7 @@ class Scheduler:
             temp_len = batch_len
             for i in range(batch_len, -1, -1):
                 kv_size = self.memory.get_block_kv(batch_req, i) # includes evicted input, and initiation input
-                if self.memory.is_avail(kv_size, Device.NPU):
+                if self._kv_can_fit(kv_size):
                     temp_len = i
                     break
 
@@ -112,13 +113,10 @@ class Scheduler:
                     continue
 
                 # else
-                evict_size += self.memory.get_evict_kv(gen_req[-1])
+                evict_size += self._evict_req_kv(gen_req[-1])
                 gen_req[-1].evict = True
                 self.logger.info("Eviction of the request #%d", gen_req[-1].id)
                 gen_req = gen_req[:-1]
-                # spill to cpu (host) memory
-                self.memory.free(evict_size, Device.NPU)
-                self.memory.allocate(evict_size, Device.CPU)
 
                 if len(gen_req) < batch_len:
                     batch_len = len(gen_req)
@@ -126,7 +124,7 @@ class Scheduler:
                 # check if can batch
                 for i in range(batch_len, -1, -1):
                     kv_size = self.memory.get_block_kv(batch_req, i)
-                    if self.memory.is_avail(kv_size, Device.NPU):
+                    if self._kv_can_fit(kv_size):
                         temp_len = i
                         break
 
@@ -168,8 +166,11 @@ class Scheduler:
                     self.logger.info("Loading the request #%d", req.id)
 
             # Allocate Needed KV caches for current batch
-            if kv_size > 0:
-                self.memory.allocate(kv_size, Device.NPU)
+            if self.enable_hbf_kv:
+                self._allocate_kv_blocks(batch_req, batch_len)
+            else:
+                if kv_size > 0:
+                    self.memory.allocate(kv_size, Device.NPU)
 
             # load memory from cpu (host)
             if load_size > 0:
@@ -202,9 +203,18 @@ class Scheduler:
                     decode_k_list.append(req.input)
                 k_list.append(req.input)
 
+            # compute hbf_kv_len for trace generation (token-granularity)
+            hbf_kv_len = 0
+            if self.enable_hbf_kv:
+                for req in batch_req:
+                    if not req.is_init:
+                        total_blocks = req.npu_kv_blocks + req.hbf_kv_blocks
+                        if total_blocks > 0:
+                            hbf_kv_len += req.input * req.hbf_kv_blocks // total_blocks
+
             # make batch, output doesn't matter here!! always one iteration
             # batch is also 1
-            batch = Batch(self.get_batch_id(), self.model, total_len, kv_len, hit_len, q_list, k_list, num_prefill, num_decode, prefill_q_list, prefill_k_list, decode_k_list, current, kv_size, evict_size, load_size)
+            batch = Batch(self.get_batch_id(), self.model, total_len, kv_len, hit_len, q_list, k_list, num_prefill, num_decode, prefill_q_list, prefill_k_list, decode_k_list, current, kv_size, evict_size, load_size, hbf_kv_len)
             # add alredy fired system
             batch.fired.append(sys)
             batch.requests.extend(batch_req)
@@ -442,11 +452,19 @@ class Scheduler:
                 for req in evicted_req:
                     self.memory.storage_cache_evicted_req(req)
 
-            
+            # compute hbf_kv_len for trace generation (proportional estimate)
+            hbf_kv_len = 0
+            if self.enable_hbf_kv and kv_len > 0:
+                hbf_kv_bytes = self.memory.hbf_used - self.memory.hbf_floor
+                npu_kv_bytes = self.memory.npu_used - self.memory.npu_floor
+                total_kv_bytes = npu_kv_bytes + hbf_kv_bytes
+                if total_kv_bytes > 0:
+                    hbf_kv_len = kv_len * hbf_kv_bytes // total_kv_bytes
+
             # For debugging
             # self.memory.npu_prefix_cache.pretty_print()
             # self.memory.npu_prefix_cache.print_prefix_info()
-            batch = Batch(self.get_batch_id(), self.model, total_len, kv_len, hit_len, q_list, k_list, num_prefill, num_decode, prefill_q_list, prefill_k_list, decode_k_list, current, kv_size, evict_size, evict_load_size + prefix_load_size)
+            batch = Batch(self.get_batch_id(), self.model, total_len, kv_len, hit_len, q_list, k_list, num_prefill, num_decode, prefill_q_list, prefill_k_list, decode_k_list, current, kv_size, evict_size, evict_load_size + prefix_load_size, hbf_kv_len=hbf_kv_len)
             # add alredy fired system
             batch.fired.append(sys)
             batch.requests.extend(batch_req)
@@ -540,8 +558,7 @@ class Scheduler:
                     if self.enable_prefix_caching:
                         self.memory.unlock_prefix(req, Device.NPU)
                     else:
-                        kv_size = self.memory.get_evict_kv(req)
-                        self.memory.free(kv_size, Device.NPU)
+                        self._free_req_kv(req)
 
                     end_reqs.append(req)
                     continue # pass generation phase and continue
@@ -560,8 +577,7 @@ class Scheduler:
                     if self.prefix_storage is not None:
                         self.memory.cache_finished_req(req, Device.CPU)
                 else:
-                    kv_size = self.memory.get_evict_kv(req)
-                    self.memory.free(kv_size, Device.NPU)
+                    self._free_req_kv(req)
                 req.add_latency(finish)
                 self.done.append(req)
                 end_reqs.append(req)
@@ -581,6 +597,80 @@ class Scheduler:
     
 
     ##### Helper Functions ######
+
+    # --- HBF KV cache helpers ---
+
+    def _one_block_kv_size(self):
+        return self.memory.get_kv(self.memory.block_size)
+
+    def _kv_can_fit(self, kv_size):
+        """Check if kv_size fits in NPU (+ HBF when enabled)."""
+        if self.enable_hbf_kv:
+            one_blk = self._one_block_kv_size()
+            npu_blocks = (self.memory.npu_mem - self.memory.npu_used) // one_blk
+            hbf_blocks = (self.memory.hbf_mem - self.memory.hbf_used) // one_blk
+            needed_blocks = (kv_size + one_blk - 1) // one_blk
+            return (npu_blocks + hbf_blocks) >= needed_blocks
+        return self.memory.is_avail(kv_size, Device.NPU)
+
+    def _allocate_kv_blocks(self, batch_req, batch_len):
+        """Allocate KV blocks per-request: NPU first, overflow to HBF."""
+        one_blk = self._one_block_kv_size()
+        for i in range(batch_len):
+            if batch_req[i].evict or batch_req[i].is_init:
+                hit = getattr(batch_req[i], 'npu_cache_hit', 0) if self.enable_prefix_caching else 0
+                needed = max(0, batch_req[i].input - hit)
+                num_blocks = needed // self.memory.block_size + 1
+            else:
+                num_before = (batch_req[i].input - 1) // self.memory.block_size + 1
+                num_after = batch_req[i].input // self.memory.block_size + 1
+                num_blocks = max(0, num_after - num_before)
+
+            for _ in range(num_blocks):
+                if self.memory.is_avail(one_blk, Device.NPU):
+                    self.memory.allocate(one_blk, Device.NPU)
+                    batch_req[i].npu_kv_blocks += 1
+                else:
+                    self.memory.allocate(one_blk, Device.HBF)
+                    batch_req[i].hbf_kv_blocks += 1
+
+    def _evict_req_kv(self, req):
+        """Evict a request's KV cache from NPU/HBF to CPU. Returns total evicted size."""
+        if self.enable_hbf_kv:
+            one_blk = self._one_block_kv_size()
+            npu_free = req.npu_kv_blocks * one_blk
+            hbf_free = req.hbf_kv_blocks * one_blk
+            total = npu_free + hbf_free
+            if npu_free > 0:
+                self.memory.free(npu_free, Device.NPU)
+            if hbf_free > 0:
+                self.memory.free(hbf_free, Device.HBF)
+            self.memory.allocate(total, Device.CPU)
+            req.npu_kv_blocks = 0
+            req.hbf_kv_blocks = 0
+            return total
+        else:
+            evict_size = self.memory.get_evict_kv(req)
+            self.memory.free(evict_size, Device.NPU)
+            self.memory.allocate(evict_size, Device.CPU)
+            return evict_size
+
+    def _free_req_kv(self, req):
+        """Free a completed/prefilled request's KV cache from NPU/HBF."""
+        if self.enable_hbf_kv:
+            one_blk = self._one_block_kv_size()
+            npu_kv = req.npu_kv_blocks * one_blk
+            hbf_kv = req.hbf_kv_blocks * one_blk
+            if npu_kv > 0:
+                self.memory.free(npu_kv, Device.NPU)
+            if hbf_kv > 0:
+                self.memory.free(hbf_kv, Device.HBF)
+            req.npu_kv_blocks = 0
+            req.hbf_kv_blocks = 0
+        else:
+            kv_size = self.memory.get_evict_kv(req)
+            self.memory.free(kv_size, Device.NPU)
+
     # get new batch id
     def get_batch_id(self):
         self.batch_ids += 1
@@ -595,8 +685,19 @@ class Scheduler:
     # add decode request to decode instance from prefill instnace
     def add_decode(self, req):
         self.request.append(req)
-        kv_size = self.memory.get_total_kv(req)
-        self.memory.allocate(kv_size, Device.NPU)
+        if self.enable_hbf_kv:
+            num_blocks = (req.input - 1) // self.memory.block_size + 1
+            one_blk = self._one_block_kv_size()
+            for _ in range(num_blocks):
+                if self.memory.is_avail(one_blk, Device.NPU):
+                    self.memory.allocate(one_blk, Device.NPU)
+                    req.npu_kv_blocks += 1
+                else:
+                    self.memory.allocate(one_blk, Device.HBF)
+                    req.hbf_kv_blocks += 1
+        else:
+            kv_size = self.memory.get_total_kv(req)
+            self.memory.allocate(kv_size, Device.NPU)
     
     # get first request's arrival time
     def get_first_arrival_time(self):
