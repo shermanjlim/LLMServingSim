@@ -47,3 +47,26 @@ python dataset/sharegpt_parser.py
 
 To create a dataset manually, write JSON objects to a `.jsonl` file following the format
 above and pass the file path via `--dataset` in `main.py`.
+
+`main.py` also supports synthetic dataset construction via:
+
+```bash
+python main.py --dataset ARRIVAL:LENGTH --load-scale LOAD_SCALE
+```
+
+In this mode, `ARRIVAL` is resolved with `ArrivalTimes.load(...)`, `LENGTH` is resolved
+with `Requests.load(...)`, and the pair is materialized into the JSONL-compatible fields
+shown above. If a length dataset does not carry real prompt token IDs, random token IDs
+are generated so the constructed dataset remains compatible with prefix-cache inputs.
+
+Optional windowing is also supported:
+
+```bash
+python main.py --dataset ARRIVAL:LENGTH --window START:END
+python main.py --dataset ARRIVAL:LENGTH --window tSTART:END
+```
+
+`START:END` slices by request index. `tSTART:END` slices by arrival time in seconds
+after applying `--load-scale`, and the kept timestamps are rebased by subtracting
+`START`; the filtered arrivals are then paired with the same number of requests from
+the length dataset.

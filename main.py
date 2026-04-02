@@ -51,10 +51,12 @@ def main():
     parser.add_argument('--enable-attn-prediction', action='store_true', help="enable realtime attention prediction", default=False)
     parser.add_argument('--prioritize-prefill', action='store_true', help="prioritize prefill", default=False)
     parser.add_argument('--block-size', type=int, help='kv cache block size unit of tokens', default=16)
-    parser.add_argument('--dataset', type=str, help='dataset path', default=None)
+    parser.add_argument('--dataset', type=str, help='dataset path or synthetic spec ARRIVAL:LENGTH', default=None)
+    parser.add_argument('--load-scale', '--load_scale', dest='load_scale', type=float, help='arrival load scaling factor for synthetic ARRIVAL:LENGTH datasets', default=1.0)
+    parser.add_argument('--window', type=str, help='dataset window: START:END for request indices, or tSTART:END for arrival-time range', default=None)
     parser.add_argument('--output', type=str, help='output path', default=None)
     parser.add_argument('--gen', action='store_false', default=True, help='skip initiation phase')
-    parser.add_argument('--num-req', type=int, help='number of requests to use', default=100)
+    parser.add_argument('--num-req', type=int, help='number of requests to use; defaults to all requests after dataset/window filtering', default=None)
     parser.add_argument('--log-interval', type=float, help='interval to log throughput (sec)', default=0.5)
     parser.add_argument('--log-level', type=str, choices=['WARNING', 'INFO', 'DEBUG'], help='log level to use', default='WARNING')
     parser.add_argument('--network-backend', type=str, choices=['analytical', 'ns3'], help='network backend to use', default='analytical')
@@ -92,11 +94,36 @@ def main():
         )
     prioritize_prefill=args.prioritize_prefill
     dataset=args.dataset
+    load_scale=args.load_scale
+    window=args.window
     output_file=args.output
     is_init=args.gen
-    num_req=args.num_req
+    requested_num_req=args.num_req
     log_interval=args.log_interval
     network_backend = args.network_backend
+    num_req = requested_num_req
+    if dataset is not None:
+        probe_router = Router(0, [], None, request_routing_policy)
+        available_num_req = probe_router.count_dataset_rows(
+            dataset,
+            load_scale=load_scale,
+            window=window,
+        )
+        if available_num_req == 0:
+            raise ValueError(f"No requests remain after applying dataset filters to '{dataset}'")
+        if requested_num_req is None:
+            num_req = available_num_req
+        else:
+            num_req = min(requested_num_req, available_num_req)
+            if num_req < requested_num_req:
+                logger.warning(
+                    "Requested --num-req=%d but only %d requests remain after dataset/window filtering. Using %d.",
+                    requested_num_req,
+                    available_num_req,
+                    num_req,
+                )
+    elif num_req is None:
+        num_req = 100
     # ---------------------------------- Extract cluster config -----------------------------------
     cluster = build_cluster_config(astra_sim, args.cluster_config, args.enable_local_offloading, args.enable_attn_offloading, enable_hbf_offloading, enable_hbf_kv)
     num_nodes = cluster["num_nodes"]
@@ -220,7 +247,13 @@ def main():
 
     # If there is no instance id, all requests are copied and added to each instance
     if dataset != None:
-        router.generate(dataset, enable_prefix_caching=enable_prefix_caching, is_init=is_init)
+        router.generate(
+            dataset,
+            enable_prefix_caching=enable_prefix_caching,
+            is_init=is_init,
+            load_scale=load_scale,
+            window=window,
+        )
     else:
         # Manually adding request
         for i in range(16):      # seq_len, end_len, arrival_time, instance_id
@@ -351,14 +384,23 @@ def main():
             ######### Per Instance Metrics #########
 
             for inst_id in range(num_instances):
-                running_reqs = sum([len(batch.requests) for batch in schedulers[inst_id].inflight] + [len([req for req in schedulers[inst_id].request if req.arrival <= current])])
+                inflight_reqs = sum(len(batch.requests) for batch in schedulers[inst_id].inflight)
+                arrived_queued_reqs = len([req for req in schedulers[inst_id].request if req.arrival <= current])
+                finished_reqs = len(schedulers[inst_id].done)
+                total_reqs = len(schedulers[inst_id].request) + inflight_reqs + finished_reqs
+                arrived_reqs = arrived_queued_reqs + inflight_reqs + finished_reqs
+                active_reqs = arrived_queued_reqs + inflight_reqs
                 
                 mem = schedulers[inst_id].memory
                 npu_used_mb = mem.npu_used / MB_TO_BYTE
                 npu_cap_mb = mem.npu_mem / MB_TO_BYTE if mem.npu_mem else 0.0
                 npu_util = (mem.npu_used / mem.npu_mem * 100.0) if mem.npu_mem else 0.0
             
-                print(f"{log_indent+tree_indent}Running Instance[{inst_id}]: {running_reqs} reqs,", end=' ')
+                print(
+                    f"{log_indent+tree_indent}Running Instance[{inst_id}]: "
+                    f"total={total_reqs}, arrived={arrived_reqs}, finished={finished_reqs}, active={active_reqs},",
+                    end=' '
+                )
                 print(f"Total # {schedulers[inst_id].npu_num} NPUs, Each NPU Memory Usage {npu_used_mb:.2f} MB ({npu_util:.3f} % Used)", end='')
                 if mem.hbf_mem > 0:
                     hbf_used_mb = mem.hbf_used / MB_TO_BYTE

@@ -14,8 +14,6 @@ from .logger import get_logger
 import numpy as np
 from math import ceil
 # import xgboost as xgb
-import sklearn
-import joblib
 import pickle
 
 # ----------------------------------------------------------------------
@@ -2216,6 +2214,14 @@ def _load_attn_predictor(hardware: str, model: str, tp: int):
     cache_key = (hardware, model, tp)
     if cache_key in _attn_predictor_cache:
         return _attn_predictor_cache[cache_key]
+
+    try:
+        import joblib
+    except Exception as e:
+        raise RuntimeError(
+            "Attention prediction dependencies are unavailable. "
+            "Disable --enable-attn-prediction or install a compatible joblib/sklearn/scipy stack."
+        ) from e
 
     base_dir = "../llm_profile/perf_models"
     model_dir = os.path.join(base_dir, hardware, model, f"tp{tp}")

@@ -117,6 +117,8 @@ def print_input_config(args):
     add("cluster_config",         "Cluster config", _na)
     add("memory_config",          "Memory config", _na)
     add("dataset",                "Dataset", _na)
+    add("load_scale",             "Load scale")
+    add("window",                 "Window", _na)
 
     add("num_req",                "Num requests")
     add("max_batch",              "Max batch", _inf0)

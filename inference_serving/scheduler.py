@@ -149,6 +149,9 @@ class Scheduler:
                 batch_req = batch_req[:-1]
                 batch_len -= 1
 
+            if batch_len == 0 or len(batch_req) == 0:
+                return None
+
             # recompute kv_size
             kv_size = self.memory.get_block_kv(batch_req, batch_len) # includes evicted input, and initiation input
 
@@ -367,6 +370,9 @@ class Scheduler:
 
                 batch_req = batch_req[:-1]
                 batch_len -= 1
+
+            if batch_len == 0 or len(batch_req) == 0:
+                return None
 
             # recompute kv_size
             kv_size = self.memory.get_block_kv(batch_req, batch_len) # includes evicted input, and initiation input
