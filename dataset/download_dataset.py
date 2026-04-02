@@ -127,7 +127,7 @@ def download_dataset(dataset_name: str):
                 answer=ex['answer'],
                 input_length=ex['input_length'],
                 thinking_length=ex['thinking_length'],
-                output_length=ex['output_length']
+                output_length=ex['output_length'] + ex['thinking_length']
             )
         
         logger.info("Creating Request objects in parallel...")
