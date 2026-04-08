@@ -529,12 +529,14 @@ class RadixCache():
                 parent_parent_tokens = node.parent.key[last_page_start:]
                 parent_block_hash = hash(tuple(parent_parent_tokens))
 
+            full_prefix = self._full_prefix(node)
+            offset = len(full_prefix) - len(node.key)
             for start in range(0, len(node.key), self.page_size):
                 page_tokens = node.key[start : start + self.page_size]
                 if not page_tokens:
                     continue
 
-                block_hash = hash(tuple(page_tokens))
+                block_hash = hash(tuple(full_prefix[:offset + start + self.page_size]))
                 self.kv_event_queue.append(
                     BlockStored(
                         block_hashes=[block_hash],
@@ -551,11 +553,14 @@ class RadixCache():
     def _record_remove_event(self, node: TreeNode):
         # One BlockRemoved per chunk.
         if self.enable_kv_cache_events:
+            full_prefix = self._full_prefix(node)
+            offset = len(full_prefix) - len(node.key)
+
             for start in range(0, len(node.key), self.page_size):
                 page_tokens = node.key[start : start + self.page_size]
                 if not page_tokens:
                     continue
-                block_hash = hash(tuple(page_tokens))
+                block_hash = hash(tuple(full_prefix[:offset + start + self.page_size]))
                 self.kv_event_queue.append(BlockRemoved(block_hashes=[block_hash]))
 
     def _record_all_cleared_event(self):
@@ -574,6 +579,18 @@ class RadixCache():
         self.kv_event_queue = []
         return events
 
+    @staticmethod
+    def _full_prefix(node: TreeNode):
+        """Return the full token sequence from root to *node*."""
+        parts = []
+        while node.parent is not None:
+            parts.append(node.key)
+            node = node.parent
+        result = []
+        for p in reversed(parts):
+            for t in p:
+                result.append(t)
+        return result
 
 if __name__ == "__main__":
     tree = RadixCache(page_size=1)

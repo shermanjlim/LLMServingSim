@@ -400,9 +400,9 @@ class MemoryModel():
             return 0
         
         if device == Device.NPU:
-            return self.npu_prefix_cache.avail_size() * self._bytes_per_token
+            return self.npu_prefix_cache.avail_size()
         elif device == Device.CPU or device == Device.CXL:
-            return self.second_tier_prefix_cache.avail_size() * self._bytes_per_token
+            return self.second_tier_prefix_cache.avail_size()
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to get available size of prefix cache in unsupported device {device}")
     
@@ -582,11 +582,13 @@ class MemoryModel():
         cpu_byte_free = 0
         for ev in self.npu_prefix_cache.take_events():
             # it's always 1. Unsure why it's a list.
-            assert len(ev.block_hashes) == 1
+            assert not hasattr(ev, "block_hashes") or len(ev.block_hashes) == 1
 
             if isinstance(ev, BlockStored):
                 tlen = len(ev.token_ids)
                 for h in ev.block_hashes:
+                    if h in self._npu_cache_hashtolen:
+                        raise RuntimeError("hash collision!")
                     self._npu_cache_hashtolen[h] = tlen
                 kv_bytes = self.get_kv(tlen)
                 # TODO: improve HBF allocation policy
@@ -618,14 +620,14 @@ class MemoryModel():
                     else:
                         npu_byte_free += kv_bytes
 
-        if npu_byte_alloc > 0:
-            self.allocate(npu_byte_alloc, Device.NPU)
         if npu_byte_free > 0:
             self.free(npu_byte_free, Device.NPU)
+        if npu_byte_alloc > 0:
+            self.allocate(npu_byte_alloc, Device.NPU)
+        if hbf_byte_free > 0:
+            self.free(hbf_byte_free, Device.HBF)                        
         if hbf_byte_alloc > 0:
             self.allocate(hbf_byte_alloc, Device.HBF)
-        if hbf_byte_free > 0:
-            self.free(hbf_byte_free, Device.HBF)
 
         if not self.enable_prefix_sharing and self.prefix_storage is Device.CPU:
             for ev in self.second_tier_prefix_cache.take_events():
