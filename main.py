@@ -58,6 +58,7 @@ def main():
     parser.add_argument('--log-interval', type=float, help='interval to log throughput (sec)', default=0.5)
     parser.add_argument('--log-level', type=str, choices=['WARNING', 'INFO', 'DEBUG'], help='log level to use', default='WARNING')
     parser.add_argument('--network-backend', type=str, choices=['analytical', 'ns3'], help='network backend to use', default='analytical')
+    parser.add_argument('--metrics-output', type=str, help='output path for metrics at steady-state', default=None)
 
     args = parser.parse_args()
 
@@ -97,6 +98,7 @@ def main():
     num_req=args.num_req
     log_interval=args.log_interval
     network_backend = args.network_backend
+    metrics_output_file = args.metrics_output
     # ---------------------------------- Extract cluster config -----------------------------------
     cluster = build_cluster_config(astra_sim, args.cluster_config, args.enable_local_offloading, args.enable_attn_offloading, enable_hbf_offloading, enable_hbf_kv)
     num_nodes = cluster["num_nodes"]
@@ -252,6 +254,18 @@ def main():
     total_latency = 0
     req_cnt = 0
 
+    # introduces a cutoff to only measure metrics at steady-state
+    REQ_CUTOFF_PCT = 0.1
+    REQ_CUTOFF_START = num_req * REQ_CUTOFF_PCT
+    REQ_CUTOFF_END = num_req * (1 - REQ_CUTOFF_PCT)
+    steady_state_start = None
+    steady_state_end = None
+    steady_state_prompt = 0
+    steady_state_gen = 0
+    steady_state_req_cnt = 0
+    steady_state_hbf_write_start = None
+    steady_state_hbf_write_end = None
+
     # Set Event Handler that loop with INTERVAL time until first request arrive (for all instances)
     first_arival_time = schedulers[0].get_first_arrival_time()
     if INTERVAL > first_arival_time:
@@ -307,6 +321,21 @@ def main():
         total_gen += gen_t
         # count only finished requests
         req_cnt += len(reqs) if instances[instance_id]["pd_type"] != "prefill" else 0
+
+        # capture metrics at steady-state
+        if req_cnt > REQ_CUTOFF_START and req_cnt < REQ_CUTOFF_END:
+            mem = schedulers[0].memory # assumes only 1 instance
+            if steady_state_start is None:
+                steady_state_start = current
+                if enable_hbf_offloading or enable_hbf_kv:
+                    steady_state_hbf_write_start = mem.hbf_write_bytes
+            else:
+                steady_state_end = current
+                steady_state_prompt += prompt_t
+                steady_state_gen += gen_t
+                steady_state_req_cnt += len(reqs) if instances[instance_id]["pd_type"] != "prefill" else 0
+                if enable_hbf_offloading or enable_hbf_kv:
+                    steady_state_hbf_write_end = mem.hbf_write_bytes
 
         # Add prefill ended requests to decode instance
         if instances[instance_id]["pd_type"] == "prefill" and len(reqs) > 0:
@@ -559,6 +588,40 @@ def main():
         for i in range(num_instances):
             schedulers[i].save_output(output_file, is_append=False if i == 0 else True)
     
+    if metrics_output_file is not None:
+        print(f"Saving metrics to output file: {metrics_output_file}")
+        metrics = {
+            # Overall throughput results
+            "total_requests": req_cnt,
+            "total_clocks_ns": current,
+            "total_latency_s": total_latency,
+            "total_input_tokens": total_prompt,
+            "total_generated_tokens": total_gen,
+            "request_throughput_req_per_s": req_cnt / total_latency,
+            "avg_prompt_throughput_tok_per_s": total_prompt / total_latency,
+            "avg_generation_throughput_tok_per_s": total_gen / total_latency,
+            "total_token_throughput_tok_per_s": (total_prompt + total_gen) / total_latency,
+        }
+        if steady_state_start is not None and steady_state_end is not None and steady_state_end > steady_state_start:
+            steady_state_latency = (steady_state_end - steady_state_start) / FREQ
+            metrics.update({
+                "steady_state_start_ns": steady_state_start,
+                "steady_state_end_ns": steady_state_end,
+                "steady_state_latency_s": steady_state_latency,
+                "steady_state_input_tokens": steady_state_prompt,
+                "steady_state_generated_tokens": steady_state_gen,
+                "steady_state_requests": steady_state_req_cnt,
+                "steady_state_request_throughput_req_per_s": steady_state_req_cnt / steady_state_latency,
+                "steady_state_prompt_throughput_tok_per_s": steady_state_prompt / steady_state_latency,
+                "steady_state_generation_throughput_tok_per_s": steady_state_gen / steady_state_latency,
+                "steady_state_total_token_throughput_tok_per_s": (steady_state_prompt + steady_state_gen) / steady_state_latency,
+            })
+            if steady_state_hbf_write_start is not None and steady_state_hbf_write_end is not None:
+                steady_state_hbf_write_bytes = steady_state_hbf_write_end - steady_state_hbf_write_start
+                metrics["steady_state_hbf_write_bytes"] = steady_state_hbf_write_bytes
+                metrics["steady_state_hbf_write_rate_MBps"] = (steady_state_hbf_write_bytes / MB_TO_BYTE) / steady_state_latency
+        with open(f'../{metrics_output_file}', "w") as f:
+            json.dump(metrics, f, indent=2)
 
 if __name__ == "__main__":
     # For simulation time breakdown
