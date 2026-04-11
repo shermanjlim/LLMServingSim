@@ -255,6 +255,9 @@ def main():
     req_cnt = 0
 
     # introduces a cutoff to only measure metrics at steady-state
+    if metrics_output_file is not None:
+        assert num_instances == 1, "Steady-state metrics only support 1 instance"
+        assert not enable_prefix_sharing, "Steady-state metrics do not support prefix sharing"
     REQ_CUTOFF_PCT = 0.1
     REQ_CUTOFF_START = num_req * REQ_CUTOFF_PCT
     REQ_CUTOFF_END = num_req * (1 - REQ_CUTOFF_PCT)
@@ -265,6 +268,12 @@ def main():
     steady_state_req_cnt = 0
     steady_state_hbf_write_start = None
     steady_state_hbf_write_end = None
+    steady_state_prefix_requested_start = 0
+    steady_state_prefix_requested_end = 0
+    steady_state_prefix_npu_hit_start = 0
+    steady_state_prefix_npu_hit_end = 0
+    steady_state_prefix_cpu_hit_start = 0
+    steady_state_prefix_cpu_hit_end = 0
 
     # Set Event Handler that loop with INTERVAL time until first request arrive (for all instances)
     first_arival_time = schedulers[0].get_first_arrival_time()
@@ -324,11 +333,15 @@ def main():
 
         # capture metrics at steady-state
         if req_cnt > REQ_CUTOFF_START and req_cnt < REQ_CUTOFF_END:
-            mem = schedulers[0].memory # assumes only 1 instance
+            mem = schedulers[0].memory
             if steady_state_start is None:
                 steady_state_start = current
                 if enable_hbf_offloading or enable_hbf_kv:
                     steady_state_hbf_write_start = mem.hbf_write_bytes
+                if enable_prefix_caching:
+                    steady_state_prefix_requested_start, steady_state_prefix_npu_hit_start = mem.npu_prefix_cache.return_prefix_info()
+                    if prefix_storage != "None":
+                        _, steady_state_prefix_cpu_hit_start = mem.second_tier_prefix_cache.return_prefix_info()
             else:
                 steady_state_end = current
                 steady_state_prompt += prompt_t
@@ -336,6 +349,10 @@ def main():
                 steady_state_req_cnt += len(reqs) if instances[instance_id]["pd_type"] != "prefill" else 0
                 if enable_hbf_offloading or enable_hbf_kv:
                     steady_state_hbf_write_end = mem.hbf_write_bytes
+                if enable_prefix_caching:
+                    steady_state_prefix_requested_end, steady_state_prefix_npu_hit_end = mem.npu_prefix_cache.return_prefix_info()
+                    if prefix_storage != "None":
+                        _, steady_state_prefix_cpu_hit_end = mem.second_tier_prefix_cache.return_prefix_info()
 
         # Add prefill ended requests to decode instance
         if instances[instance_id]["pd_type"] == "prefill" and len(reqs) > 0:
@@ -602,6 +619,15 @@ def main():
             "avg_generation_throughput_tok_per_s": total_gen / total_latency,
             "total_token_throughput_tok_per_s": (total_prompt + total_gen) / total_latency,
         }
+        # Overall prefix caching metrics
+        if enable_prefix_caching and total_requested_tokens > 0:
+            metrics["total_prefix_requested_tokens"] = total_requested_tokens
+            metrics["total_prefix_npu_hit_tokens"] = total_npu_hit_tokens
+            metrics["total_prefix_npu_hit_ratio_pct"] = (total_npu_hit_tokens / total_requested_tokens) * 100
+            if prefix_storage != "None":
+                metrics["total_prefix_cpu_hit_tokens"] = total_cpu_hit_tokens
+                metrics["total_prefix_cpu_hit_ratio_pct"] = (total_cpu_hit_tokens / total_requested_tokens) * 100
+            metrics["total_prefix_total_hit_ratio_pct"] = ((total_npu_hit_tokens + total_cpu_hit_tokens) / total_requested_tokens) * 100
         if steady_state_start is not None and steady_state_end is not None and steady_state_end > steady_state_start:
             steady_state_latency = (steady_state_end - steady_state_start) / FREQ
             metrics.update({
@@ -620,6 +646,17 @@ def main():
                 steady_state_hbf_write_bytes = steady_state_hbf_write_end - steady_state_hbf_write_start
                 metrics["steady_state_hbf_write_bytes"] = steady_state_hbf_write_bytes
                 metrics["steady_state_hbf_write_rate_MBps"] = (steady_state_hbf_write_bytes / MB_TO_BYTE) / steady_state_latency
+            if enable_prefix_caching and steady_state_prefix_requested_end > steady_state_prefix_requested_start:
+                ss_requested = steady_state_prefix_requested_end - steady_state_prefix_requested_start
+                ss_npu_hit = steady_state_prefix_npu_hit_end - steady_state_prefix_npu_hit_start
+                ss_cpu_hit = steady_state_prefix_cpu_hit_end - steady_state_prefix_cpu_hit_start
+                metrics["steady_state_prefix_requested_tokens"] = ss_requested
+                metrics["steady_state_prefix_npu_hit_tokens"] = ss_npu_hit
+                metrics["steady_state_prefix_npu_hit_ratio_pct"] = (ss_npu_hit / ss_requested) * 100
+                if prefix_storage != "None":
+                    metrics["steady_state_prefix_cpu_hit_tokens"] = ss_cpu_hit
+                    metrics["steady_state_prefix_cpu_hit_ratio_pct"] = (ss_cpu_hit / ss_requested) * 100
+                metrics["steady_state_prefix_total_hit_ratio_pct"] = ((ss_npu_hit + ss_cpu_hit) / ss_requested) * 100
         with open(f'../{metrics_output_file}', "w") as f:
             json.dump(metrics, f, indent=2)
 
