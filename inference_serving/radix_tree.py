@@ -263,7 +263,8 @@ class RadixCache():
             )
 
     def insert(self, key: List, value=None):
-        return self._insert_helper(self.root_node, key)
+        prefix_len, _last_node = self._insert_helper(self.root_node, key)
+        return prefix_len
 
     def cache_finished_req(self, req):
         """Cache request when it finishes."""
@@ -293,7 +294,7 @@ class RadixCache():
             insert_token_ids = token_ids[:page_aligned_len]
 
             # Radix Cache takes one ref in memory pool
-            new_prefix_len = self.insert(insert_token_ids)
+            new_prefix_len, new_last_node = self._insert_helper(self.root_node, insert_token_ids)
 
             if req.is_init and update:
                 self.total_requested_tokens += len(token_ids)
@@ -303,10 +304,6 @@ class RadixCache():
                     self.total_hit_tokens += (req.storage_cache_hit - req.npu_cache_hit) if (req.storage_cache_hit - req.npu_cache_hit) > 0 else 0
                 else:
                     raise RuntimeError(f"[RadixCache] [node_id={self.node_id}]: Unknown device type {self.device} for prefix caching")
-
-            # The prefix indices could be updated, reuse it
-            result = self.match_prefix(insert_token_ids)
-            new_last_node = result.last_device_node
 
             return new_last_node
 
@@ -377,9 +374,10 @@ class RadixCache():
 
     def total_size(self):
         # total size refers to the size of the entire cache, including both evictable and protected cache
-        return self._total_size_helper() # token count not Byte size
+        return self.evictable_size_ + self.protected_size_ # token count not Byte size
 
-    def _total_size_helper(self):
+    def _total_size_slow(self):
+        """Full tree traversal -- kept for debug assertions only."""
         total_size = 0
         stack = [self.root_node]
         while stack:
@@ -435,7 +433,7 @@ class RadixCache():
     def _insert_helper(self, node: TreeNode, key: List):
         node.last_access_time = time.monotonic()
         if len(key) == 0:
-            return 0
+            return 0, node
 
         child_key = self.get_child_key_fn(key)
 
@@ -461,7 +459,8 @@ class RadixCache():
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
             self._record_store_event(new_node)
-        return total_prefix_length
+            node = new_node
+        return total_prefix_length, node
     
     def _print_helper(self, node: TreeNode, indent: int):
         """Prints the radix tree in a human-readable format."""

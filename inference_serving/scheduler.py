@@ -370,7 +370,8 @@ class Scheduler:
 
             # recompute kv_size
             kv_size = self.memory.get_block_kv(batch_req, batch_len) # includes evicted input, and initiation input
-            evict_size = (kv_size - self.memory.avail_size(Device.NPU)) if kv_size > self.memory.avail_size(Device.NPU) else 0
+            npu_avail = self.memory.avail_size(Device.NPU)
+            evict_size = (kv_size - npu_avail) if kv_size > npu_avail else 0
 
             if evict_size > 0:
                 # self.memory.npu_evict_prefix_cache(evict_size)
@@ -419,7 +420,8 @@ class Scheduler:
                 total_size += self.memory.get_total_kv(req) * self.npu_num
             
             if self.prefix_storage is not None:
-                storage_evict_size = (total_size - self.memory.avail_size(self.prefix_storage)) if total_size > self.memory.avail_size(self.prefix_storage) else 0
+                storage_avail = self.memory.avail_size(self.prefix_storage)
+                storage_evict_size = (total_size - storage_avail) if total_size > storage_avail else 0
                 
                 if storage_evict_size > 0:
                     # self.memory.cpu_evict_prefix_cache(cpu_evict_size)
