@@ -27,7 +27,7 @@
         }
     ],
     "hbf_mem": {
-        "mem_size": 40,
+        "mem_size": 120,
         "mem_bw": 768,
         "mem_latency": 10000
     }
