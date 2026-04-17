@@ -33,44 +33,39 @@ def apply_kv_cache_events(self):
     cpu_byte_alloc = 0
     cpu_byte_free = 0
     for ev in self.npu_prefix_cache.take_events():
-        # it's always 1. Unsure why it's a list.
-        assert not hasattr(ev, "block_hashes") or len(ev.block_hashes) == 1
-
         if isinstance(ev, BlockStored):
             tlen = len(ev.token_ids)
-            for h in ev.block_hashes:
-                if h in self._npu_cache_hashtolen:
-                    raise RuntimeError("hash collision!")
-                self._npu_cache_hashtolen[h] = tlen
+            h = ev.block_hash
+            if h in self._npu_cache_hashtolen:
+                raise RuntimeError("hash collision!")
+            self._npu_cache_hashtolen[h] = tlen
             kv_bytes = self.get_kv(tlen)
             # TODO: improve HBF allocation policy
             if self.enable_hbf_kv:
                 npu_free = self.npu_mem - self.npu_used - (npu_byte_alloc - npu_byte_free)
                 if kv_bytes <= npu_free:
                     npu_byte_alloc += kv_bytes
-                    for h in ev.block_hashes:
-                        self._block_hash_to_device[h] = Device.NPU
+                    self._block_hash_to_device[h] = Device.NPU
                 else:
                     hbf_byte_alloc += kv_bytes
-                    for h in ev.block_hashes:
-                        self._block_hash_to_device[h] = Device.HBF
+                    self._block_hash_to_device[h] = Device.HBF
             else:
                 npu_byte_alloc += kv_bytes
         elif isinstance(ev, BlockRemoved):
-            for h in ev.block_hashes:
-                tlen = self._npu_cache_hashtolen.pop(h, 0)
-                if tlen == 0:
-                    self.logger.warning("NPU prefix cache remove unknown block hash {h}")
-                    continue
-                kv_bytes = self.get_kv(tlen)
-                if self.enable_hbf_kv:
-                    device = self._block_hash_to_device.pop(h)
-                    if device == Device.HBF:
-                        hbf_byte_free += kv_bytes
-                    else:
-                        npu_byte_free += kv_bytes
+            h = ev.block_hash
+            tlen = self._npu_cache_hashtolen.pop(h, 0)
+            if tlen == 0:
+                self.logger.warning("NPU prefix cache remove unknown block hash {h}")
+                continue
+            kv_bytes = self.get_kv(tlen)
+            if self.enable_hbf_kv:
+                device = self._block_hash_to_device.pop(h)
+                if device == Device.HBF:
+                    hbf_byte_free += kv_bytes
                 else:
                     npu_byte_free += kv_bytes
+            else:
+                npu_byte_free += kv_bytes
 
     if npu_byte_free > 0:
         self.free(npu_byte_free, Device.NPU)
@@ -85,13 +80,11 @@ def apply_kv_cache_events(self):
         for ev in self.second_tier_prefix_cache.take_events():
             if isinstance(ev, BlockStored):
                 tlen = len(ev.token_ids)
-                for h in ev.block_hashes:
-                    self._cpu_cache_hashtolen[h] = tlen
+                self._cpu_cache_hashtolen[ev.block_hash] = tlen
                 cpu_byte_alloc += self.get_kv(tlen) * self.npu_num
             elif isinstance(ev, BlockRemoved):
-                for h in ev.block_hashes:
-                    tlen = self._cpu_cache_hashtolen.pop(h, 0)
-                    cpu_byte_free += self.get_kv(tlen) * self.npu_num
+                tlen = self._cpu_cache_hashtolen.pop(ev.block_hash, 0)
+                cpu_byte_free += self.get_kv(tlen) * self.npu_num
 
         if cpu_byte_alloc > 0:
             self.allocate(cpu_byte_alloc, Device.CPU)

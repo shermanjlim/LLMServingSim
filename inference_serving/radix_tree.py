@@ -46,7 +46,7 @@ class KVCacheEvent(
 
 
 class BlockStored(KVCacheEvent):
-    block_hashes: list[int]
+    block_hash: int
     parent_block_hash: Optional[int]
     token_ids: list[int]
     block_size: int
@@ -54,7 +54,7 @@ class BlockStored(KVCacheEvent):
 
 
 class BlockRemoved(KVCacheEvent):
-    block_hashes: list[int]
+    block_hash: int
 
 
 class AllBlocksCleared(KVCacheEvent):
@@ -538,7 +538,7 @@ class RadixCache():
                 block_hash = hash(tuple(full_prefix[:offset + start + self.page_size]))
                 self.kv_event_queue.append(
                     BlockStored(
-                        block_hashes=[block_hash],
+                        block_hash=block_hash,
                         parent_block_hash=parent_block_hash,
                         token_ids=page_tokens,
                         block_size=len(page_tokens),
@@ -560,7 +560,7 @@ class RadixCache():
                 if not page_tokens:
                     continue
                 block_hash = hash(tuple(full_prefix[:offset + start + self.page_size]))
-                self.kv_event_queue.append(BlockRemoved(block_hashes=[block_hash]))
+                self.kv_event_queue.append(BlockRemoved(block_hash=block_hash))
 
     def _record_all_cleared_event(self):
         if self.enable_kv_cache_events:
