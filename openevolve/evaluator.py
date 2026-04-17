@@ -11,6 +11,13 @@ BACKUP_PATH = MEMORY_MODEL_PATH + ".evolve_bak"
 METRICS_FILENAME = "baseline.json"
 METRICS_PATH = os.path.join(REPO_ROOT, METRICS_FILENAME)
 
+# Baseline produced by the initial "NPU first, HBF overflow" policy on
+# our_cluster_config/6_hbm_2_hbf.json with the same CMD below. The user
+# requires throughput to stay >= baseline; candidates that regress
+# throughput are heavily penalized via the score formula.
+BASELINE_THROUGHPUT_TOK_PER_S = 5646.225165816023
+BASELINE_HBF_WRITE_RATE_MBPS = 406.9275798498747
+
 CMD = [
     "python", "main.py",
     "--cluster-config", "our_cluster_config/6_hbm_2_hbf.json",
@@ -33,7 +40,7 @@ EVOLVE_BLOCK_RE = re.compile(
     re.DOTALL,
 )
 METHOD_RE = re.compile(
-    r"^    def apply_kv_cache_events\(self\):.*?(?=^    def )",
+    r"^    def _device_allocate_policy\(.*?\).*?(?=^    def )",
     re.DOTALL | re.MULTILINE,
 )
 
@@ -45,8 +52,8 @@ def _extract_evolved_function(program_path):
     if m is None:
         raise RuntimeError("EVOLVE-BLOCK markers not found in program file")
     body = m.group("body").strip("\n")
-    if "def apply_kv_cache_events" not in body:
-        raise RuntimeError("evolved block must define apply_kv_cache_events")
+    if "def _device_allocate_policy" not in body:
+        raise RuntimeError("evolved block must define _device_allocate_policy")
     return body
 
 
@@ -59,7 +66,7 @@ def _patch_memory_model(evolved_text):
     indented = "\n".join(indented_lines) + "\n\n"
     patched, n = METHOD_RE.subn(indented, original, count=1)
     if n == 0:
-        raise RuntimeError("could not locate apply_kv_cache_events in memory_model.py")
+        raise RuntimeError("could not locate _device_allocate_policy in memory_model.py")
     with open(MEMORY_MODEL_PATH, "w") as f:
         f.write(patched)
 
@@ -119,12 +126,24 @@ def evaluate(program_path):
         # Reward throughput, penalize HBF write rate. Adding 1.0 to the
         # denominator keeps the score finite when writes go to zero and gives
         # a smooth gradient near the low-write regime we care about.
-        combined = float(throughput) / (1.0 + float(hbf_rate))
+        throughput_f = float(throughput)
+        hbf_rate_f = float(hbf_rate)
+        combined = throughput_f / (1.0 + hbf_rate_f)
+
+        # Hard constraint: steady-state throughput must not fall below the
+        # baseline. We apply a steep (ratio**5) multiplicative penalty rather
+        # than a 0.0 cliff so the optimizer still sees gradient shape when
+        # variants land just under the target.
+        throughput_ratio = throughput_f / BASELINE_THROUGHPUT_TOK_PER_S
+        if throughput_ratio < 1.0:
+            combined *= throughput_ratio ** 5
 
         return {
             "combined_score": combined,
-            "throughput_tok_per_s": float(throughput),
-            "hbf_write_rate_MBps": float(hbf_rate),
+            "throughput_tok_per_s": throughput_f,
+            "hbf_write_rate_MBps": hbf_rate_f,
+            "throughput_ratio_vs_baseline": throughput_ratio,
+            "hbf_write_ratio_vs_baseline": hbf_rate_f / BASELINE_HBF_WRITE_RATE_MBPS,
             "elapsed_s": elapsed,
         }
     except subprocess.TimeoutExpired:

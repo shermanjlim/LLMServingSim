@@ -581,6 +581,15 @@ class MemoryModel():
         if not self.enable_prefix_sharing and self.prefix_storage is not None:
             self.free(self.second_tier_prefix_cache.evictable_size() * self._bytes_per_token * self.npu_num, self.prefix_storage)
     
+    # Evolve target: decide NPU vs HBF placement for one newly stored KV block.
+    # Only called when self.enable_hbf_kv is True. Must return Device.NPU or
+    # Device.HBF. Kept intentionally small so OpenEvolve can iterate on just
+    # the placement policy without touching the surrounding bookkeeping.
+    def _device_allocate_policy(self, ev, kv_bytes, npu_free_bytes, hbf_free_bytes):
+        if kv_bytes <= npu_free_bytes:
+            return Device.NPU
+        return Device.HBF
+
     # Count load/unload events from prefix cache and update memory usage
     def apply_kv_cache_events(self):
         # if not self.enable_prefix_caching:
@@ -599,15 +608,21 @@ class MemoryModel():
                     raise RuntimeError("hash collision!")
                 self._npu_cache_hashtolen[h] = tlen
                 kv_bytes = self.get_kv(tlen)
-                # TODO: improve HBF allocation policy
                 if self.enable_hbf_kv:
                     npu_free = self.npu_mem - self.npu_used - (npu_byte_alloc - npu_byte_free)
-                    if kv_bytes <= npu_free:
+                    hbf_free = self.hbf_mem - self.hbf_used - (hbf_byte_alloc - hbf_byte_free)
+                    device = self._device_allocate_policy(ev, kv_bytes, npu_free, hbf_free)
+                    if device == Device.NPU:
                         npu_byte_alloc += kv_bytes
                         self._block_hash_to_device[h] = Device.NPU
-                    else:
+                    elif device == Device.HBF:
                         hbf_byte_alloc += kv_bytes
                         self._block_hash_to_device[h] = Device.HBF
+                    else:
+                        raise RuntimeError(
+                            f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] "
+                            f"_device_allocate_policy returned {device!r}; expected Device.NPU or Device.HBF."
+                        )
                 else:
                     npu_byte_alloc += kv_bytes
             elif isinstance(ev, BlockRemoved):
