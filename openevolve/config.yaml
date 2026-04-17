@@ -1,0 +1,6 @@
+max_iterations: 2
+llm:  
+  models:
+    - name: "claude-haiku-4-5-20251001-v1:0"
+      weight: 1.0
+  api_base: "https://ai-gateway.andrew.cmu.edu"
