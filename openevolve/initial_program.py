@@ -18,6 +18,13 @@
 # Names imported at module scope of memory_model.py:
 #   BlockStored, BlockRemoved (from .radix_tree)
 #   Device (NPU / CPU / CXL / HBF enum)
+# BlockStored fields useful for placement:
+#   ev.block_hash, ev.parent_block_hash, ev.token_ids, ev.block_size, ev.lora_id
+#   ev.full_token_ids  -- full token prefix from root up to end of this block
+#   ev.hit_count       -- historical match_prefix hits for this block_hash
+#                         (non-zero means this content was matched before eviction)
+# RadixCache also exposes `npu_prefix_cache.block_hit_counts[block_hash]` for
+# querying live hit counts of any tracked block, updated on every match_prefix.
 #
 # Optimization goal: increase (or hold) steady_state_total_token_throughput_tok_per_s
 # while decreasing steady_state_hbf_write_rate_MBps. HBF writes are tracked inside

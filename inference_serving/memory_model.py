@@ -546,7 +546,18 @@ class MemoryModel():
     def erase_prefix_info(self, req):
         if not self.enable_prefix_caching:
             return
-        
+
+        # Undo the match_prefix hit-count bumps so block_hit_counts tracks
+        # admitted reuse, not rolled-back admission attempts.
+        if req.npu_last_node is not None:
+            self.npu_prefix_cache.rollback_block_hits(
+                req.npu_last_node, req.npu_cache_hit
+            )
+        if self.prefix_storage is not None and req.storage_last_node is not None:
+            self.second_tier_prefix_cache.rollback_block_hits(
+                req.storage_last_node, req.storage_cache_hit
+            )
+
         req.prefix_cache_hit = 0
         req.npu_cache_hit = 0
         req.storage_cache_hit = 0
