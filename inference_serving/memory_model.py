@@ -14,6 +14,11 @@ class Device(Enum):
     CXL = 3
     HBF = 4
 
+# `_device_allocate_policy` lives in its own module so OpenEvolve can rewrite
+# just that file to substitute a new placement policy. Import must follow
+# `Device` because `device_allocate_policy` imports `Device` from this module.
+from .device_allocate_policy import _device_allocate_policy
+
 class MemoryModel():
     def __init__(self, model, instance_id, node_id, npu_num, npu_group, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0,
                  hbf_mem=0, enable_hbf_offloading=False, enable_hbf_kv=False):
@@ -581,15 +586,6 @@ class MemoryModel():
         if not self.enable_prefix_sharing and self.prefix_storage is not None:
             self.free(self.second_tier_prefix_cache.evictable_size() * self._bytes_per_token * self.npu_num, self.prefix_storage)
     
-    # Evolve target: decide NPU vs HBF placement for one newly stored KV block.
-    # Only called when self.enable_hbf_kv is True. Must return Device.NPU or
-    # Device.HBF. Kept intentionally small so OpenEvolve can iterate on just
-    # the placement policy without touching the surrounding bookkeeping.
-    def _device_allocate_policy(self, ev, kv_bytes, npu_free_bytes, hbf_free_bytes):
-        if kv_bytes <= npu_free_bytes:
-            return Device.NPU
-        return Device.HBF
-
     # Count load/unload events from prefix cache and update memory usage
     def apply_kv_cache_events(self):
         # if not self.enable_prefix_caching:
@@ -611,7 +607,7 @@ class MemoryModel():
                 if self.enable_hbf_kv:
                     npu_free = self.npu_mem - self.npu_used - (npu_byte_alloc - npu_byte_free)
                     hbf_free = self.hbf_mem - self.hbf_used - (hbf_byte_alloc - hbf_byte_free)
-                    device = self._device_allocate_policy(ev, kv_bytes, npu_free, hbf_free)
+                    device = _device_allocate_policy(self, ev, kv_bytes, npu_free, hbf_free)
                     if device == Device.NPU:
                         npu_byte_alloc += kv_bytes
                         self._block_hash_to_device[h] = Device.NPU

@@ -657,7 +657,7 @@ def main():
                     metrics["steady_state_prefix_cpu_hit_tokens"] = ss_cpu_hit
                     metrics["steady_state_prefix_cpu_hit_ratio_pct"] = (ss_cpu_hit / ss_requested) * 100
                 metrics["steady_state_prefix_total_hit_ratio_pct"] = ((ss_npu_hit + ss_cpu_hit) / ss_requested) * 100
-        with open(f'../{metrics_output_file}', "w") as f:
+        with open(f'{metrics_output_file}', "w") as f:
             json.dump(metrics, f, indent=2)
 
 if __name__ == "__main__":
