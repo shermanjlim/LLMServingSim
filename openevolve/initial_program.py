@@ -112,17 +112,6 @@ Target: keep throughput >= 5646 tok/s, drive `hbf_write_rate_MBps` downward.
 
 # EVOLVE-BLOCK-START
 def _device_allocate_policy(self, ev, kv_bytes, npu_free_bytes, hbf_free_bytes):
-    # Baseline placement: fill NPU first, spill to HBF when it can't fit.
-    # Constraints reiterated for the evolved variants:
-    #   - Must return Device.NPU or Device.HBF.
-    #   - Must not return a device where kv_bytes > <that device>_free_bytes.
-    # Ideas to explore (read from `self` and `ev`):
-    #   - Use ev.hit_count as a hotness signal (>0 implies past reuse).
-    #   - Inspect self._block_hash_to_device.get(ev.parent_block_hash) to see
-    #     where the parent block landed; keep chains together.
-    #   - Reserve a fraction of NPU (e.g. 20%) as headroom for per-request KV,
-    #     sending cold blocks to HBF earlier than the hard capacity limit.
-    #   - Use len(ev.full_token_ids) as a proxy for prefix depth / value.
     if kv_bytes <= npu_free_bytes:
         return Device.NPU
     return Device.HBF

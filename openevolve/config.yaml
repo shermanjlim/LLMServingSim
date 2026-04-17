@@ -1,4 +1,4 @@
-max_iterations: 2
+max_iterations: 50
 llm:  
   models:
     - name: "claude-haiku-4-5-20251001-v1:0"
