@@ -16,7 +16,7 @@ BACKUP_PATH = POLICY_PATH + ".evolve_bak"
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "results")
 
 
-def run_simulation(program_path, show_output=False):
+def run_simulation(program_path, show_output=False, cleanup=False):
     program_name = os.path.splitext(os.path.basename(program_path))[0]
     os.makedirs(RESULTS_DIR, exist_ok=True)
     os.chmod(RESULTS_DIR, 0o777)
@@ -33,7 +33,7 @@ def run_simulation(program_path, show_output=False):
                 "--block-size", "16",
                 "--dataset", "dataset/ShareGPT_Vicuna_unfiltered_req5000_rate200.jsonl",
                 "--output", "output/example_single_run.csv",
-                "--num-req", "2000",
+                "--num-req", "5000",
                 "--max-batch", "512",
                 "--enable-prefix-caching",
                 "--enable-hbf-offload",
@@ -52,7 +52,10 @@ def run_simulation(program_path, show_output=False):
 
     os.chmod(metrics_path, 0o666)
     with open(metrics_path) as f:
-        return json.load(f)
+        metrics = json.load(f)
+    if cleanup:
+        os.remove(metrics_path)
+    return metrics
 
 
 if __name__ == "__main__":
