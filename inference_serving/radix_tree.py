@@ -46,15 +46,21 @@ class KVCacheEvent(
 
 
 class BlockStored(KVCacheEvent):
-    block_hashes: list[int]
+    block_hash: int
     parent_block_hash: Optional[int]
     token_ids: list[int]
     block_size: int
     lora_id: Optional[int]
+    # Full token prefix from root up to (and including) this block's tokens.
+    full_token_ids: list[int]
+    # Historical hit count for this block_hash tracked by RadixCache.
+    # Non-zero here means the same content was seen (and matched) before,
+    # even if it was evicted and is now being re-stored.
+    hit_count: int
 
 
 class BlockRemoved(KVCacheEvent):
-    block_hashes: list[int]
+    block_hash: int
 
 
 class AllBlocksCleared(KVCacheEvent):
@@ -152,6 +158,12 @@ class RadixCache():
         self.total_requested_tokens = 0
         self.total_hit_tokens = 0
 
+        # Per-block hit counters keyed by block_hash. Incremented on each
+        # match_prefix call for every page-sized chunk that was a hit.
+        # Entries persist across BlockRemoved so a re-inserted block keeps
+        # its historical popularity signal.
+        self.block_hit_counts: dict[int, int] = {}
+
         if self.page_size == 1:
             self.key_match_fn = _key_match_page_size1
             self.get_child_key_fn = lambda key: key[0]
@@ -232,6 +244,8 @@ class RadixCache():
         self.root_node.lock_ref = 1
         self.evictable_size_ = 0
         self.protected_size_ = 0
+        if hasattr(self, "block_hit_counts"):
+            self.block_hit_counts.clear()
         self._record_all_cleared_event()
 
     def match_prefix(self, key: List[int], **kwargs) -> MatchResult:
@@ -253,17 +267,40 @@ class RadixCache():
                 )
 
             hit_length, last_node = self._match_prefix_helper(self.root_node, key)
-            
+
             if self.page_size != 1:
                 hit_length = hit_length // self.page_size * self.page_size
+
+            self._record_block_hits(last_node, hit_length)
 
             return MatchResult(
                 last_device_node=last_node,
                 hit_length=hit_length,
             )
 
+    def rollback_block_hits(self, last_node: "TreeNode", hit_length: int):
+        """Undo a prior match_prefix hit-count bump.
+
+        Used when a request's match_prefix ran but the request was later
+        rolled back (e.g. admission failed). Keeps block_hit_counts aligned
+        with *admitted* reuse rather than attempted reuse.
+        """
+        if last_node is None or hit_length < self.page_size:
+            return
+        with self._lock:
+            full_prefix = self._full_prefix(last_node)
+            end = min(hit_length, len(full_prefix))
+            for chunk_end in range(self.page_size, end + 1, self.page_size):
+                block_hash = hash(tuple(full_prefix[:chunk_end]))
+                current = self.block_hit_counts.get(block_hash, 0)
+                if current <= 1:
+                    self.block_hit_counts.pop(block_hash, None)
+                else:
+                    self.block_hit_counts[block_hash] = current - 1
+
     def insert(self, key: List, value=None):
-        return self._insert_helper(self.root_node, key)
+        prefix_len, _last_node = self._insert_helper(self.root_node, key)
+        return prefix_len
 
     def cache_finished_req(self, req):
         """Cache request when it finishes."""
@@ -293,7 +330,7 @@ class RadixCache():
             insert_token_ids = token_ids[:page_aligned_len]
 
             # Radix Cache takes one ref in memory pool
-            new_prefix_len = self.insert(insert_token_ids)
+            new_prefix_len, new_last_node = self._insert_helper(self.root_node, insert_token_ids)
 
             if req.is_init and update:
                 self.total_requested_tokens += len(token_ids)
@@ -303,10 +340,6 @@ class RadixCache():
                     self.total_hit_tokens += (req.storage_cache_hit - req.npu_cache_hit) if (req.storage_cache_hit - req.npu_cache_hit) > 0 else 0
                 else:
                     raise RuntimeError(f"[RadixCache] [node_id={self.node_id}]: Unknown device type {self.device} for prefix caching")
-
-            # The prefix indices could be updated, reuse it
-            result = self.match_prefix(insert_token_ids)
-            new_last_node = result.last_device_node
 
             return new_last_node
 
@@ -377,9 +410,10 @@ class RadixCache():
 
     def total_size(self):
         # total size refers to the size of the entire cache, including both evictable and protected cache
-        return self._total_size_helper() # token count not Byte size
+        return self.evictable_size_ + self.protected_size_ # token count not Byte size
 
-    def _total_size_helper(self):
+    def _total_size_slow(self):
+        """Full tree traversal -- kept for debug assertions only."""
         total_size = 0
         stack = [self.root_node]
         while stack:
@@ -435,7 +469,7 @@ class RadixCache():
     def _insert_helper(self, node: TreeNode, key: List):
         node.last_access_time = time.monotonic()
         if len(key) == 0:
-            return 0
+            return 0, node
 
         child_key = self.get_child_key_fn(key)
 
@@ -461,7 +495,8 @@ class RadixCache():
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
             self._record_store_event(new_node)
-        return total_prefix_length
+            node = new_node
+        return total_prefix_length, node
     
     def _print_helper(self, node: TreeNode, indent: int):
         """Prints the radix tree in a human-readable format."""
@@ -516,6 +551,19 @@ class RadixCache():
 
         return ret_list
 
+    def _record_block_hits(self, last_node: TreeNode, hit_length: int):
+        """Bump hit counters for every page-sized chunk in the matched prefix.
+        """
+        if hit_length < self.page_size:
+            return
+        full_prefix = self._full_prefix(last_node)
+        end = min(hit_length, len(full_prefix))
+        for chunk_end in range(self.page_size, end + 1, self.page_size):
+            block_hash = hash(tuple(full_prefix[:chunk_end]))
+            self.block_hit_counts[block_hash] = (
+                self.block_hit_counts.get(block_hash, 0) + 1
+            )
+
     def _record_store_event(self, node: TreeNode):
         # One BlockStored per ``page_size`` chunk.
         if self.enable_kv_cache_events:
@@ -529,19 +577,25 @@ class RadixCache():
                 parent_parent_tokens = node.parent.key[last_page_start:]
                 parent_block_hash = hash(tuple(parent_parent_tokens))
 
+            full_prefix = self._full_prefix(node)
+            offset = len(full_prefix) - len(node.key)
             for start in range(0, len(node.key), self.page_size):
                 page_tokens = node.key[start : start + self.page_size]
                 if not page_tokens:
                     continue
 
-                block_hash = hash(tuple(page_tokens))
+                block_end = offset + start + len(page_tokens)
+                full_token_ids = list(full_prefix[:block_end])
+                block_hash = hash(tuple(full_token_ids))
                 self.kv_event_queue.append(
                     BlockStored(
-                        block_hashes=[block_hash],
+                        block_hash=block_hash,
                         parent_block_hash=parent_block_hash,
                         token_ids=page_tokens,
                         block_size=len(page_tokens),
                         lora_id=None,
+                        full_token_ids=full_token_ids,
+                        hit_count=self.block_hit_counts.get(block_hash, 0),
                     )
                 )
 
@@ -551,12 +605,15 @@ class RadixCache():
     def _record_remove_event(self, node: TreeNode):
         # One BlockRemoved per chunk.
         if self.enable_kv_cache_events:
+            full_prefix = self._full_prefix(node)
+            offset = len(full_prefix) - len(node.key)
+
             for start in range(0, len(node.key), self.page_size):
                 page_tokens = node.key[start : start + self.page_size]
                 if not page_tokens:
                     continue
-                block_hash = hash(tuple(page_tokens))
-                self.kv_event_queue.append(BlockRemoved(block_hashes=[block_hash]))
+                block_hash = hash(tuple(full_prefix[:offset + start + self.page_size]))
+                self.kv_event_queue.append(BlockRemoved(block_hash=block_hash))
 
     def _record_all_cleared_event(self):
         if self.enable_kv_cache_events:
@@ -574,6 +631,18 @@ class RadixCache():
         self.kv_event_queue = []
         return events
 
+    @staticmethod
+    def _full_prefix(node: TreeNode):
+        """Return the full token sequence from root to *node*."""
+        parts = []
+        while node.parent is not None:
+            parts.append(node.key)
+            node = node.parent
+        result = []
+        for p in reversed(parts):
+            for t in p:
+                result.append(t)
+        return result
 
 if __name__ == "__main__":
     tree = RadixCache(page_size=1)

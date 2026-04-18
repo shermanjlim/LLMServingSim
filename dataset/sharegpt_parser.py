@@ -15,21 +15,23 @@ random.seed(42)
 np.random.seed(42)
 
 # --------- Config ----------
-dataset_name = "shibing624/sharegpt_gpt4"
+dataset_name = "anon8231489123/ShareGPT_Vicuna_unfiltered"
+dataset_file = "ShareGPT_V3_unfiltered_cleaned_split.json"
 tokenizer_name = "meta-llama/Llama-3.1-8B"
 # tokenizer_name = "microsoft/Phi-mini-MoE-instruct"
 # tokenizer_name = "mistralai/Mixtral-8x7B-v0.1"
-request_per_sec = 10
+request_per_sec = 200
 room_for_decode = 0 # leave room for decode input tokens (200 for only moe models)
 max_input_length = 2048 - room_for_decode 
 max_output_length = 2048
-max_kv_length = 2048 
-max_sessions = 1000 # 100, 300
-max_requests = 512 # 300
-output_path = f"sharegpt_req{max_requests}_rate{request_per_sec}.jsonl"
+max_kv_length = 2048
+min_kv_length = 1024
+max_sessions = 10000
+max_requests = 5000
+output_path = f"{dataset_name.split('/')[1]}_req{max_requests}_rate{request_per_sec}.jsonl"
 first_arrival_time = 0 # first arrival time in seconds
 
-fix_len = True  # if True, use fixed length inputs/outputs
+fix_len = False  # if True, use fixed length inputs/outputs
 if fix_len:
     fix_input_length = 128
     fix_output_length = 512
@@ -45,7 +47,9 @@ if pulse:
 
 # --------- Load ----------
 tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
-dataset = load_dataset(dataset_name, split="train").select(range(max_sessions))
+dataset = load_dataset("json",
+                        data_files=f"hf://datasets/{dataset_name}/{dataset_file}",
+                        split="train").select(range(max_sessions))
 
 
 # --------- Parse sessions ----------
@@ -101,6 +105,8 @@ with open(output_path, "w", encoding="utf-8") as fout:
             output_tokens = tokenizer(output_text, add_special_tokens=False)["input_ids"]
 
             if len(input_tokens) > max_input_length or len(output_tokens) > max_output_length or len(input_tokens) + len(output_tokens) > max_kv_length:
+                continue
+            if len(input_tokens) + len(output_tokens) < min_kv_length:
                 continue
         else:
             # fixed length inputs/outputs

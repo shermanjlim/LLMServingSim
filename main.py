@@ -63,6 +63,7 @@ def main():
     parser.add_argument('--steady-window', type=float, help='profiling window duration in seconds collected after --steady-min-s, then exit early', default=None)
     parser.add_argument('--log-level', type=str, choices=['WARNING', 'INFO', 'DEBUG'], help='log level to use', default='WARNING')
     parser.add_argument('--network-backend', type=str, choices=['analytical', 'ns3'], help='network backend to use', default='analytical')
+    parser.add_argument('--metrics-output', type=str, help='output path for metrics at steady-state', default=None)
 
     args = parser.parse_args()
     requested_load_scale = args.load_scale
@@ -130,6 +131,7 @@ def main():
     num_req = requested_num_req
     steady_min_s = args.steady_min_s
     steady_window_s = args.steady_window
+    metrics_output_file = args.metrics_output
     if (steady_min_s is None) != (steady_window_s is None):
         raise ValueError("--steady-min-s and --steady-window must be provided together")
     if steady_min_s is not None:
@@ -391,6 +393,27 @@ def main():
     def safe_rate(numerator, denominator):
         return numerator / denominator if denominator > 0 else 0.0
 
+    # introduces a cutoff to only measure metrics at steady-state
+    if metrics_output_file is not None:
+        assert num_instances == 1, "Steady-state metrics only support 1 instance"
+        assert not enable_prefix_sharing, "Steady-state metrics do not support prefix sharing"
+    REQ_CUTOFF_PCT = 0.1
+    REQ_CUTOFF_START = num_req * REQ_CUTOFF_PCT
+    REQ_CUTOFF_END = num_req * (1 - REQ_CUTOFF_PCT)
+    steady_state_start = None
+    steady_state_end = None
+    steady_state_prompt = 0
+    steady_state_gen = 0
+    steady_state_req_cnt = 0
+    steady_state_hbf_write_start = None
+    steady_state_hbf_write_end = None
+    steady_state_prefix_requested_start = 0
+    steady_state_prefix_requested_end = 0
+    steady_state_prefix_npu_hit_start = 0
+    steady_state_prefix_npu_hit_end = 0
+    steady_state_prefix_cpu_hit_start = 0
+    steady_state_prefix_cpu_hit_end = 0
+
     # Set Event Handler that loop with INTERVAL time until first request arrive (for all instances)
     first_arival_time = schedulers[0].get_first_arrival_time()
     if INTERVAL > first_arival_time:
@@ -460,6 +483,29 @@ def main():
             profiled_end_ns = current
             # count only finished requests
             req_cnt += len(reqs) if instances[instance_id]["pd_type"] != "prefill" else 0
+
+        # capture metrics at steady-state
+        if req_cnt > REQ_CUTOFF_START and req_cnt < REQ_CUTOFF_END:
+            mem = schedulers[0].memory
+            if steady_state_start is None:
+                steady_state_start = current
+                if enable_hbf_offloading or enable_hbf_kv:
+                    steady_state_hbf_write_start = mem.hbf_write_bytes
+                if enable_prefix_caching:
+                    steady_state_prefix_requested_start, steady_state_prefix_npu_hit_start = mem.npu_prefix_cache.return_prefix_info()
+                    if prefix_storage != "None":
+                        _, steady_state_prefix_cpu_hit_start = mem.second_tier_prefix_cache.return_prefix_info()
+            else:
+                steady_state_end = current
+                steady_state_prompt += prompt_t
+                steady_state_gen += gen_t
+                steady_state_req_cnt += len(reqs) if instances[instance_id]["pd_type"] != "prefill" else 0
+                if enable_hbf_offloading or enable_hbf_kv:
+                    steady_state_hbf_write_end = mem.hbf_write_bytes
+                if enable_prefix_caching:
+                    steady_state_prefix_requested_end, steady_state_prefix_npu_hit_end = mem.npu_prefix_cache.return_prefix_info()
+                    if prefix_storage != "None":
+                        _, steady_state_prefix_cpu_hit_end = mem.second_tier_prefix_cache.return_prefix_info()
 
         # Add prefill ended requests to decode instance
         if instances[instance_id]["pd_type"] == "prefill" and len(reqs) > 0:
@@ -741,6 +787,60 @@ def main():
         for i in range(num_instances):
             schedulers[i].save_output(output_file, is_append=False if i == 0 else True)
     
+    if metrics_output_file is not None:
+        print(f"Saving metrics to output file: {metrics_output_file}")
+        metrics = {
+            # Overall throughput results
+            "total_requests": req_cnt,
+            "total_clocks_ns": current,
+            "total_latency_s": total_latency,
+            "total_input_tokens": total_prompt,
+            "total_generated_tokens": total_gen,
+            "request_throughput_req_per_s": req_cnt / total_latency,
+            "avg_prompt_throughput_tok_per_s": total_prompt / total_latency,
+            "avg_generation_throughput_tok_per_s": total_gen / total_latency,
+            "total_token_throughput_tok_per_s": (total_prompt + total_gen) / total_latency,
+        }
+        # Overall prefix caching metrics
+        if enable_prefix_caching and total_requested_tokens > 0:
+            metrics["total_prefix_requested_tokens"] = total_requested_tokens
+            metrics["total_prefix_npu_hit_tokens"] = total_npu_hit_tokens
+            metrics["total_prefix_npu_hit_ratio_pct"] = (total_npu_hit_tokens / total_requested_tokens) * 100
+            if prefix_storage != "None":
+                metrics["total_prefix_cpu_hit_tokens"] = total_cpu_hit_tokens
+                metrics["total_prefix_cpu_hit_ratio_pct"] = (total_cpu_hit_tokens / total_requested_tokens) * 100
+            metrics["total_prefix_total_hit_ratio_pct"] = ((total_npu_hit_tokens + total_cpu_hit_tokens) / total_requested_tokens) * 100
+        if steady_state_start is not None and steady_state_end is not None and steady_state_end > steady_state_start:
+            steady_state_latency = (steady_state_end - steady_state_start) / FREQ
+            metrics.update({
+                "steady_state_start_ns": steady_state_start,
+                "steady_state_end_ns": steady_state_end,
+                "steady_state_latency_s": steady_state_latency,
+                "steady_state_input_tokens": steady_state_prompt,
+                "steady_state_generated_tokens": steady_state_gen,
+                "steady_state_requests": steady_state_req_cnt,
+                "steady_state_request_throughput_req_per_s": steady_state_req_cnt / steady_state_latency,
+                "steady_state_prompt_throughput_tok_per_s": steady_state_prompt / steady_state_latency,
+                "steady_state_generation_throughput_tok_per_s": steady_state_gen / steady_state_latency,
+                "steady_state_total_token_throughput_tok_per_s": (steady_state_prompt + steady_state_gen) / steady_state_latency,
+            })
+            if steady_state_hbf_write_start is not None and steady_state_hbf_write_end is not None:
+                steady_state_hbf_write_bytes = steady_state_hbf_write_end - steady_state_hbf_write_start
+                metrics["steady_state_hbf_write_bytes"] = steady_state_hbf_write_bytes
+                metrics["steady_state_hbf_write_rate_MBps"] = (steady_state_hbf_write_bytes / MB_TO_BYTE) / steady_state_latency
+            if enable_prefix_caching and steady_state_prefix_requested_end > steady_state_prefix_requested_start:
+                ss_requested = steady_state_prefix_requested_end - steady_state_prefix_requested_start
+                ss_npu_hit = steady_state_prefix_npu_hit_end - steady_state_prefix_npu_hit_start
+                ss_cpu_hit = steady_state_prefix_cpu_hit_end - steady_state_prefix_cpu_hit_start
+                metrics["steady_state_prefix_requested_tokens"] = ss_requested
+                metrics["steady_state_prefix_npu_hit_tokens"] = ss_npu_hit
+                metrics["steady_state_prefix_npu_hit_ratio_pct"] = (ss_npu_hit / ss_requested) * 100
+                if prefix_storage != "None":
+                    metrics["steady_state_prefix_cpu_hit_tokens"] = ss_cpu_hit
+                    metrics["steady_state_prefix_cpu_hit_ratio_pct"] = (ss_cpu_hit / ss_requested) * 100
+                metrics["steady_state_prefix_total_hit_ratio_pct"] = ((ss_npu_hit + ss_cpu_hit) / ss_requested) * 100
+        with open(f'{metrics_output_file}', "w") as f:
+            json.dump(metrics, f, indent=2)
 
 if __name__ == "__main__":
     # For simulation time breakdown

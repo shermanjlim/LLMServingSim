@@ -1,0 +1,52 @@
+max_iterations: 50
+llm:
+  models:
+    - name: "claude-sonnet-4-20250514-v1:0"
+      weight: 1.0
+  api_base: "https://ai-gateway.andrew.cmu.edu"
+prompt:
+  system_message: |
+    You are an expert systems programmer specializing in LLM inference serving systems.
+    You are currently using a new type of GPU with both high-bandwidth memory (HBM)
+    and high-bandwidth flash (HBF). The total amount of HBM memory (npu_mem) is 24GB while 
+    the total amount of HBF memory is 80GB. You are optimizing a single function,
+    `_device_allocate_policy`, which decides whether a newly allocated KV-cache block is
+    placed on NPU HBM or HBF.
+
+    =========================================================================
+    SCORING — read this first
+    =========================================================================
+    You are scored ONLY on steady-state `hbf_write_rate_MBps`:
+        score = -hbf_write_rate_MBps
+              = -(MB placed on HBF during steady state) / (steady-state seconds)
+    The objective is to maximize this score (i.e., drive HBF write rate toward 0).
+    Steady-state refers to the period where the first and last 10% of requests are
+    cut off.
+
+    Assume both HBM and HBF are saturated throughout steady state; every allocation
+    forces evictions somewhere later. The policy only chooses which side churns. An
+    "NPU-first, HBF-on-overflow" fallback is the baseline — beating it requires
+    routing blocks by their expected reuse, not just by free space.
+
+    =========================================================================
+    OPTIMIZATION OPPORTUNITIES
+    =========================================================================
+    We want to minimize the situation where we repeatedly allocate to HBF and then evict
+    from it. Such data should go to HBM.
+
+    =========================================================================
+    Hard constraints (violating these crashes the simulator)
+    =========================================================================
+    - Return exactly `Device.NPU` or `Device.HBF`. Any other value raises.
+    - If you return Device.NPU, kv_bytes MUST be <= npu_free_bytes.
+    - If you return Device.HBF, kv_bytes MUST be <= hbf_free_bytes.
+    - The scheduler normally ensures at least one side has room, but your
+      policy must still handle "preferred device full -> fall back" safely.
+    - Do NOT change the function signature, the import, or the
+      `# EVOLVE-BLOCK-START` / `# EVOLVE-BLOCK-END` markers.
+    - Do NOT add module-level state, global mutation, I/O, or new imports.
+      The policy runs on every block of every request - keep it cheap and
+      deterministic from the passed signals.
+    - Read self.* freely (e.g. self.hbf_write_bytes, self.npu_used). Do NOT
+      mutate self: the policy must be a pure function of its inputs. Stashing
+      state on self will not persist reliably across calls or instances.

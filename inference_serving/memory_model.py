@@ -14,6 +14,11 @@ class Device(Enum):
     CXL = 3
     HBF = 4
 
+# `_device_allocate_policy` lives in its own module so OpenEvolve can rewrite
+# just that file to substitute a new placement policy. Import must follow
+# `Device` because `device_allocate_policy` imports `Device` from this module.
+from .device_allocate_policy import _device_allocate_policy
+
 class MemoryModel():
     def __init__(self, model, instance_id, node_id, npu_num, npu_group, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0,
                  hbf_mem=0, enable_hbf_offloading=False, enable_hbf_kv=False):
@@ -400,9 +405,9 @@ class MemoryModel():
             return 0
         
         if device == Device.NPU:
-            return self.npu_prefix_cache.avail_size() * self._bytes_per_token
+            return self.npu_prefix_cache.avail_size()
         elif device == Device.CPU or device == Device.CXL:
-            return self.second_tier_prefix_cache.avail_size() * self._bytes_per_token
+            return self.second_tier_prefix_cache.avail_size()
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to get available size of prefix cache in unsupported device {device}")
     
@@ -411,8 +416,8 @@ class MemoryModel():
     def storage_cache_evicted_req(self, req):
         if self.enable_prefix_caching:
             new_last_node = self.second_tier_prefix_cache.cache_unfinished_req(req, update=False) # do not update hit counts
-            # should lock evicted kv cache in cpu
-            self.npu_prefix_cache.inc_lock_ref(new_last_node)
+            # should lock evicted kv cache in storage (cpu/cxl)
+            self.second_tier_prefix_cache.inc_lock_ref(new_last_node)
             req.cpu_last_node = new_last_node
             self.apply_kv_cache_events()
 
@@ -546,7 +551,18 @@ class MemoryModel():
     def erase_prefix_info(self, req):
         if not self.enable_prefix_caching:
             return
-        
+
+        # Undo the match_prefix hit-count bumps so block_hit_counts tracks
+        # admitted reuse, not rolled-back admission attempts.
+        if req.npu_last_node is not None:
+            self.npu_prefix_cache.rollback_block_hits(
+                req.npu_last_node, req.npu_cache_hit
+            )
+        if self.prefix_storage is not None and req.storage_last_node is not None:
+            self.second_tier_prefix_cache.rollback_block_hits(
+                req.storage_last_node, req.storage_cache_hit
+            )
+
         req.prefix_cache_hit = 0
         req.npu_cache_hit = 0
         req.storage_cache_hit = 0
@@ -581,63 +597,64 @@ class MemoryModel():
         cpu_byte_alloc = 0
         cpu_byte_free = 0
         for ev in self.npu_prefix_cache.take_events():
-            # it's always 1. Unsure why it's a list.
-            assert len(ev.block_hashes) == 1
-
             if isinstance(ev, BlockStored):
                 tlen = len(ev.token_ids)
-                for h in ev.block_hashes:
-                    self._npu_cache_hashtolen[h] = tlen
+                h = ev.block_hash
+                if h in self._npu_cache_hashtolen:
+                    raise RuntimeError("hash collision!")
+                self._npu_cache_hashtolen[h] = tlen
                 kv_bytes = self.get_kv(tlen)
-                # TODO: improve HBF allocation policy
                 if self.enable_hbf_kv:
                     npu_free = self.npu_mem - self.npu_used - (npu_byte_alloc - npu_byte_free)
-                    if kv_bytes <= npu_free:
+                    hbf_free = self.hbf_mem - self.hbf_used - (hbf_byte_alloc - hbf_byte_free)
+                    device = _device_allocate_policy(self, ev, kv_bytes, npu_free, hbf_free)
+                    if device == Device.NPU:
                         npu_byte_alloc += kv_bytes
-                        for h in ev.block_hashes:
-                            self._block_hash_to_device[h] = Device.NPU
-                    else:
+                        self._block_hash_to_device[h] = Device.NPU
+                    elif device == Device.HBF:
                         hbf_byte_alloc += kv_bytes
-                        for h in ev.block_hashes:
-                            self._block_hash_to_device[h] = Device.HBF
+                        self._block_hash_to_device[h] = Device.HBF
+                    else:
+                        raise RuntimeError(
+                            f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] "
+                            f"_device_allocate_policy returned {device!r}; expected Device.NPU or Device.HBF."
+                        )
                 else:
                     npu_byte_alloc += kv_bytes
             elif isinstance(ev, BlockRemoved):
-                for h in ev.block_hashes:
-                    tlen = self._npu_cache_hashtolen.pop(h, 0)
-                    if tlen == 0:
-                        self.logger.warning("NPU prefix cache remove unknown block hash {h}")
-                        continue
-                    kv_bytes = self.get_kv(tlen)
-                    if self.enable_hbf_kv:
-                        device = self._block_hash_to_device.pop(h)
-                        if device == Device.HBF:
-                            hbf_byte_free += kv_bytes
-                        else:
-                            npu_byte_free += kv_bytes
+                h = ev.block_hash
+                tlen = self._npu_cache_hashtolen.pop(h, 0)
+                if tlen == 0:
+                    self.logger.warning("NPU prefix cache remove unknown block hash {h}")
+                    continue
+                kv_bytes = self.get_kv(tlen)
+                if self.enable_hbf_kv:
+                    device = self._block_hash_to_device.pop(h)
+                    if device == Device.HBF:
+                        hbf_byte_free += kv_bytes
                     else:
                         npu_byte_free += kv_bytes
+                else:
+                    npu_byte_free += kv_bytes
 
-        if npu_byte_alloc > 0:
-            self.allocate(npu_byte_alloc, Device.NPU)
         if npu_byte_free > 0:
             self.free(npu_byte_free, Device.NPU)
+        if npu_byte_alloc > 0:
+            self.allocate(npu_byte_alloc, Device.NPU)
+        if hbf_byte_free > 0:
+            self.free(hbf_byte_free, Device.HBF)                        
         if hbf_byte_alloc > 0:
             self.allocate(hbf_byte_alloc, Device.HBF)
-        if hbf_byte_free > 0:
-            self.free(hbf_byte_free, Device.HBF)
 
         if not self.enable_prefix_sharing and self.prefix_storage is Device.CPU:
             for ev in self.second_tier_prefix_cache.take_events():
                 if isinstance(ev, BlockStored):
                     tlen = len(ev.token_ids)
-                    for h in ev.block_hashes:
-                        self._cpu_cache_hashtolen[h] = tlen
+                    self._cpu_cache_hashtolen[ev.block_hash] = tlen
                     cpu_byte_alloc += self.get_kv(tlen) * self.npu_num
                 elif isinstance(ev, BlockRemoved):
-                    for h in ev.block_hashes:
-                        tlen = self._cpu_cache_hashtolen.pop(h, 0)
-                        cpu_byte_free += self.get_kv(tlen) * self.npu_num
+                    tlen = self._cpu_cache_hashtolen.pop(ev.block_hash, 0)
+                    cpu_byte_free += self.get_kv(tlen) * self.npu_num
 
             if cpu_byte_alloc > 0:
                 self.allocate(cpu_byte_alloc, Device.CPU)
