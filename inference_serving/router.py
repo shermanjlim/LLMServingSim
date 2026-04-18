@@ -60,7 +60,10 @@ class Router:
         return int(row['input_length']) <= int(max_input_tokens)
 
     def _dataset_path(self, path):
-        return f'../{path}'
+        if os.path.isabs(path):
+            return path
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return os.path.join(repo_root, path)
 
     def _is_jsonl_dataset(self, dataset_spec):
         return os.path.isfile(self._dataset_path(dataset_spec))
@@ -72,6 +75,39 @@ class Router:
                 "Synthetic dataset spec must use the form ARRIVAL:LENGTH"
             )
         return parts[0], parts[1]
+
+    def _infer_synthetic_arrival_rps(self, arrival_name):
+        from dataset.dataset import ArrivalTimes
+
+        arrival_times = list(ArrivalTimes.load(arrival_name, load_scale=1.0).arrival_times)
+        if len(arrival_times) < 2:
+            raise ValueError(
+                f"Arrival dataset '{arrival_name}' must contain at least two arrivals to infer --rps"
+            )
+
+        # Use the mean inter-arrival rate so the initial startup gap does not skew the target.
+        duration = float(arrival_times[-1]) - float(arrival_times[0])
+        if duration <= 0:
+            raise ValueError(
+                f"Arrival dataset '{arrival_name}' must have strictly increasing arrival times to infer --rps"
+            )
+        return (len(arrival_times) - 1) / duration
+
+    def resolve_load_scale(self, dataset_spec, load_scale=1.0, rps=None):
+        if rps is None:
+            return load_scale, None
+        if dataset_spec is None:
+            raise ValueError("--rps requires --dataset ARRIVAL:LENGTH")
+        if rps <= 0:
+            raise ValueError("--rps must be > 0")
+        if self._is_jsonl_dataset(dataset_spec):
+            raise ValueError(
+                "--rps is only supported for synthetic ARRIVAL:LENGTH datasets"
+            )
+
+        arrival_name, _ = self._parse_synthetic_dataset_spec(dataset_spec)
+        native_rps = self._infer_synthetic_arrival_rps(arrival_name)
+        return rps / native_rps, native_rps
 
     def _parse_window_spec(self, window):
         if window is None:
