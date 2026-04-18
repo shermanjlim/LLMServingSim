@@ -1,4 +1,6 @@
 max_iterations: 50
+evaluator:
+  timeout: 1200
 llm:
   models:
     - name: "claude-sonnet-4-20250514-v1:0"
