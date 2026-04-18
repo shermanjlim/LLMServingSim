@@ -19,13 +19,84 @@ python main.py \
     --cluster-config 'cluster_config/single_node_single_instance_hbf.json' \
     --fp 16 --block-size 16 \
     --dataset azure_chat_23:deepseek-r1 \
-    --window 0:60 \
+    --window 0:1000 \
     --load-scale 1.0 \
+    --steady-min-s 60 \
+    --steady-window 120 \
     --output 'output/example_single_run.csv' \
     --log-interval 1.0 \
     --enable-hbf-offloading \
     --enable-hbf-kv
 ```
+
+`--steady-min-s` and `--steady-window` switch the simulator into a bounded
+steady-state profiling mode. The run warms up for `steady-min-s`, resets
+throughput / latency / per-request output / HBF write counters, profiles only
+the interval `[steady-min-s, steady-min-s + steady-window)`, then exits.
+
+`--window 0:60` is a request-index slice, not a 60-second slice. Use `--window t0:60`
+if you want the first 60 seconds of arrivals instead of the first 60 requests.
+
+`--enable-hbf-offloading` and `--enable-hbf-kv` do different things:
+
+- `--enable-hbf-offloading` places model weights on HBF.
+- `--enable-hbf-kv` allows KV blocks to spill to HBF only after NPU KV capacity is exhausted.
+
+With the provided `cluster_config/single_node_single_instance_hbf.json`, Llama-3.1-8B
+on an A6000 still has substantial NPU KV headroom after weights are placed, so
+`--enable-hbf-kv` may show no change unless the workload is long enough or the load is high
+enough to force KV spill.
+
+## Comparing the tradeoff
+
+To compare throughput and latency across all HBF flag combinations in one shot:
+
+```sh
+python3 script/hbf_tradeoff.py \
+    --cluster-config 'cluster_config/single_node_single_instance_hbf.json' \
+    --dataset azure_chat_23:deepseek-r1 \
+    --window t0:60 \
+    --load-scale 1.0 \
+    --log-interval 1.0
+```
+
+This runs four scenarios:
+
+- `baseline`
+- `hbf_kv_only`
+- `hbf_weights_only`
+- `hbf_weights_kv`
+
+and writes per-scenario logs/CSVs plus `output/hbf_tradeoff/summary.csv`.
+
+To sweep request-rate multipliers and plot the tradeoff across the three main
+scenarios (`no spill`, `weight spill`, `weight+KV spill`):
+
+```sh
+python3 script/hbf_tradeoff_sweep.py \
+    --cluster-config 'cluster_config/single_node_single_instance_hbf.json' \
+    --dataset azure_chat_23:deepseek-r1 \
+    --window 0:1000 \
+    --request-rates 0.50,0.75,1.00,1.25,1.50
+```
+
+This writes:
+
+- `output/hbf_tradeoff_sweep/summary.csv`
+- `output/hbf_tradeoff_sweep/tradeoff.png`
+
+The plot contains:
+
+- offered load scale vs average generation throughput
+- throughput vs latency (default: mean TPOT)
+- throughput vs HBF writes
+
+Failed runs are kept in the summary and marked on the load-scale panel so the
+unsupported high-load region is visible instead of stopping the sweep.
+
+For `azure_chat_23` with `--window 0:1000`, the baseline offered arrival rate at
+`--load-scale 1.0` is about `4.62 req/s`, so a compute limit near `1 req/s`
+corresponds to roughly `--load-scale 0.216`.
 
 This runs for ~60s, example output 
 ```
