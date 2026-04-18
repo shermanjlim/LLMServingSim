@@ -12,10 +12,7 @@ def generate_graph(batch, hardware, npu_num, node_id=0, instance_id=0, npu_offse
     chakra = os.path.join(cwd, "extern/graph_frontend/chakra")
     os.chdir(chakra)
 
-    if event:
-        file_name = 'event_handler'
-    else:
-        file_name = f'{hardware}/{batch.model}/instance{instance_id}_batch{batch.batch_id}'
+    file_name = get_workload_file_name(batch, hardware, instance_id=instance_id, event=event)
 
     workload_dir = f'../../../inputs/workload/{file_name}'
     os.makedirs(workload_dir, exist_ok=True)

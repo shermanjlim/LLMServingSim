@@ -43,13 +43,28 @@ _FMT = (
 )
 
 def get_workload(batch, hardware, instance_id=0, event=False):
+    file_name = get_workload_file_name(batch, hardware, instance_id=instance_id, event=event)
+    cwd = os.getcwd()
+    return cwd+f"/inputs/workload/{file_name}/llm"
+
+def get_run_tag():
+    run_tag = os.environ.get("LLMSERVINGSIM_RUN_TAG", "").strip()
+    if not run_tag:
+        return ""
+    return "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in run_tag)
+
+def get_run_scoped_file_name(file_name):
+    run_tag = get_run_tag()
+    if not run_tag:
+        return file_name
+    return f"{run_tag}/{file_name}"
+
+def get_workload_file_name(batch, hardware, instance_id=0, event=False):
     if event:
         file_name = 'event_handler'
     else:
         file_name = f'{hardware}/{batch.model}/instance{instance_id}_batch{batch.batch_id}'
-
-    cwd = os.getcwd()
-    return cwd+f"/inputs/workload/{file_name}/llm"
+    return get_run_scoped_file_name(file_name)
 
 def header():
     string_list = ["Layername","comp_time","input_loc","input_size","weight_loc","weight_size","output_loc","output_size","comm_type","comm_size","misc"]
@@ -117,6 +132,7 @@ def print_input_config(args):
     add("cluster_config",         "Cluster config", _na)
     add("memory_config",          "Memory config", _na)
     add("dataset",                "Dataset", _na)
+    add("rps",                    "Target RPS", _na)
     add("load_scale",             "Load scale")
     add("window",                 "Window", _na)
 
