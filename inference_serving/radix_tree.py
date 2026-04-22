@@ -57,6 +57,8 @@ class BlockStored(KVCacheEvent):
     # Non-zero here means the same content was seen (and matched) before,
     # even if it was evicted and is now being re-stored.
     hit_count: int
+    # Number of input (prompt) tokens in the request that caused this store.
+    num_input_tokens: int
 
 
 class BlockRemoved(KVCacheEvent):
@@ -298,8 +300,8 @@ class RadixCache():
                 else:
                     self.block_hit_counts[block_hash] = current - 1
 
-    def insert(self, key: List, value=None):
-        prefix_len, _last_node = self._insert_helper(self.root_node, key)
+    def insert(self, key: List, value=None, num_input_tokens: int = 0):
+        prefix_len, _last_node = self._insert_helper(self.root_node, key, num_input_tokens)
         return prefix_len
 
     def cache_finished_req(self, req):
@@ -315,7 +317,7 @@ class RadixCache():
                 page_aligned_len = len(token_ids)
 
             # Radix Cache takes one ref in memory pool
-            new_prefix_len = self.insert(token_ids[:page_aligned_len])
+            new_prefix_len = self.insert(token_ids[:page_aligned_len], num_input_tokens=req.original_input)
 
     def cache_unfinished_req(self, req, update=True):
         """Cache request when it is unfinished."""
@@ -330,7 +332,7 @@ class RadixCache():
             insert_token_ids = token_ids[:page_aligned_len]
 
             # Radix Cache takes one ref in memory pool
-            new_prefix_len, new_last_node = self._insert_helper(self.root_node, insert_token_ids)
+            new_prefix_len, new_last_node = self._insert_helper(self.root_node, insert_token_ids, req.original_input)
 
             if req.is_init and update:
                 self.total_requested_tokens += len(token_ids)
@@ -466,7 +468,7 @@ class RadixCache():
 
         return new_node
 
-    def _insert_helper(self, node: TreeNode, key: List):
+    def _insert_helper(self, node: TreeNode, key: List, num_input_tokens: int = 0):
         node.last_access_time = time.monotonic()
         if len(key) == 0:
             return 0, node
@@ -494,7 +496,7 @@ class RadixCache():
             new_node.key = key
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
-            self._record_store_event(new_node)
+            self._record_store_event(new_node, num_input_tokens)
             node = new_node
         return total_prefix_length, node
     
@@ -564,7 +566,7 @@ class RadixCache():
                 self.block_hit_counts.get(block_hash, 0) + 1
             )
 
-    def _record_store_event(self, node: TreeNode):
+    def _record_store_event(self, node: TreeNode, num_input_tokens: int = 0):
         # One BlockStored per ``page_size`` chunk.
         if self.enable_kv_cache_events:
             # First chunk links to the last page of the parent node (if any).
@@ -596,6 +598,7 @@ class RadixCache():
                         lora_id=None,
                         full_token_ids=full_token_ids,
                         hit_count=self.block_hit_counts.get(block_hash, 0),
+                        num_input_tokens=num_input_tokens,
                     )
                 )
 

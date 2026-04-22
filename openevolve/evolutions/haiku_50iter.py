@@ -41,6 +41,10 @@ def _device_allocate_policy(self, ev, kv_bytes, npu_free_bytes, hbf_free_bytes):
               by the radix cache for this block hash. Non-zero means
               this exact block content has been matched before
               (possibly evicted and now being re-stored).
+            * ``ev.num_input_tokens`` (int): original prompt length
+              (``req.original_input``) of the request that caused this
+              block to be stored. Useful for distinguishing prefill
+              blocks from blocks produced by long decodes.
 
         kv_bytes (int): bytes this single block will occupy once
             allocated (equal to ``self.get_kv(len(ev.token_ids))``).
