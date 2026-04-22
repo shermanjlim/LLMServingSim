@@ -45,12 +45,26 @@ if pulse:
     delay_seconds = 60 # 15, delay after sending the pulse
     output_path = f"sharegpt_pulse_req{num_req_pulse}_n{max_requests//num_req_pulse}_delay{delay_seconds}.jsonl"
 
+# --------- System prompt config ----------
+use_system_prompt = True   # if True, inject a system prompt into the first turn of each session
+num_system_prompts = 10    # number of distinct system prompts in the pool
+system_prompt_length = 256 # length of each system prompt (in tokens)
+if use_system_prompt:
+    output_path = output_path.replace(".jsonl", f"_sys{num_system_prompts}x{system_prompt_length}.jsonl")
+
 # --------- Load ----------
 tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
 dataset = load_dataset("json",
                         data_files=f"hf://datasets/{dataset_name}/{dataset_file}",
                         split="train").select(range(max_sessions))
 
+# --------- Build system prompt pool ----------
+if use_system_prompt:
+    sp_vocab_size = tokenizer.vocab_size if hasattr(tokenizer, "vocab_size") else 32000
+    system_prompts = [
+        [random.randint(0, sp_vocab_size - 1) for _ in range(system_prompt_length)]
+        for _ in range(num_system_prompts)
+    ]
 
 # --------- Parse sessions ----------
 if not fix_len:
@@ -82,7 +96,9 @@ if not fix_len:
 
         if turns:
             sessions.append(turns)
-    session_indices = [0] * len(sessions) 
+    session_indices = [0] * len(sessions)
+    if use_system_prompt:
+        session_system_prompts = [random.choice(system_prompts) for _ in range(len(sessions))]
 
 
 time_offset_ns = first_arrival_time * 1_000_000_000
@@ -98,11 +114,15 @@ with open(output_path, "w", encoding="utf-8") as fout:
                 break
             
             sid = random.choice(available_sessions)
-            input_text, output_text = sessions[sid][session_indices[sid]]
+            turn_idx = session_indices[sid]
+            input_text, output_text = sessions[sid][turn_idx]
             session_indices[sid] += 1
 
             input_tokens = tokenizer(input_text, add_special_tokens=False)["input_ids"]
             output_tokens = tokenizer(output_text, add_special_tokens=False)["input_ids"]
+
+            if use_system_prompt:
+                input_tokens = session_system_prompts[sid] + input_tokens
 
             if len(input_tokens) > max_input_length or len(output_tokens) > max_output_length or len(input_tokens) + len(output_tokens) > max_kv_length:
                 continue

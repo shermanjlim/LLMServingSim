@@ -31,7 +31,7 @@ def run_simulation(program_path, show_output=False, cleanup=False):
                 "--cluster-config", "our_cluster_config/6_hbm_2_hbf.json",
                 "--fp", "16",
                 "--block-size", "16",
-                "--dataset", "dataset/ShareGPT_Vicuna_unfiltered_req5000_rate200.jsonl",
+                "--dataset", "dataset/ShareGPT_Vicuna_unfiltered_req5000_rate200_sys10x256.jsonl",
                 "--output", "output/example_single_run.csv",
                 "--num-req", "5000",
                 "--max-batch", "512",
