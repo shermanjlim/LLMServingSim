@@ -1,16 +1,39 @@
-max_iterations: 50
+max_iterations: 100
+checkpoint_interval: 20
+
 evaluator:
   timeout: 1200
+
 llm:
   models:
+    - name: "claude-haiku-4-5-20251001-v1:0"
+      weight: 0.7
     - name: "claude-sonnet-4-20250514-v1:0"
+      weight: 0.3
+  evaluator_models:
+    - name: "claude-haiku-4-5-20251001-v1:0"
       weight: 1.0
   api_base: "https://ai-gateway.andrew.cmu.edu"
+  temperature: 0.9
+  top_p: 0.95
+
+database:
+  population_size: 100
+  archive_size: 50
+  num_islands: 4
+  migration_interval: 25
+  exploration_ratio: 0.35
+  exploitation_ratio: 0.55
+  feature_dimensions: ["score", "complexity"]
+  feature_bins: 6
+
 prompt:
+  num_top_programs: 4
+  num_diverse_programs: 3
   system_message: |
     You are an expert systems programmer specializing in LLM inference serving systems.
     You are currently using a new type of GPU with both high-bandwidth memory (HBM)
-    and high-bandwidth flash (HBF). The total amount of HBM memory (npu_mem) is 24GB while 
+    and high-bandwidth flash (HBF). The total amount of HBM memory (npu_mem) is 24GB while
     the total amount of HBF memory is 80GB. You are optimizing a single function,
     `_device_allocate_policy`, which decides whether a newly allocated KV-cache block is
     placed on NPU HBM or HBF.
