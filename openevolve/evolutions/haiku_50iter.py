@@ -45,6 +45,12 @@ def _device_allocate_policy(self, ev, kv_bytes, npu_free_bytes, hbf_free_bytes):
               (``req.original_input``) of the request that caused this
               block to be stored. Useful for distinguishing prefill
               blocks from blocks produced by long decodes.
+            * ``ev.num_output_tokens`` (int): target total sequence
+              length — input + output tokens — (``req.output``) of the
+              request that caused this block to be stored. Subtract
+              ``ev.num_input_tokens`` to get the pure decode length.
+              Useful for anticipating how many more decode blocks this
+              request will still generate.
 
         kv_bytes (int): bytes this single block will occupy once
             allocated (equal to ``self.get_kv(len(ev.token_ids))``).

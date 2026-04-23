@@ -35,6 +35,10 @@ prompt:
     =========================================================================
     We want to minimize the situation where we repeatedly allocate to HBF and then evict
     from it. Such data should go to HBM.
+    The optimization hint is that blocks that would be useful for longer should go on HBF.
+    (e.g., if a newly allocated block is part of a request that still has a lot more decode
+    blocks, then it should go on HBF because it'll be used much longer than a block that is
+    allocated towards the end of the decoding process.)
 
     =========================================================================
     Hard constraints (violating these crashes the simulator)

@@ -48,7 +48,7 @@ if pulse:
 # --------- System prompt config ----------
 use_system_prompt = True   # if True, inject a system prompt into the first turn of each session
 num_system_prompts = 10    # number of distinct system prompts in the pool
-system_prompt_length = 256 # length of each system prompt (in tokens)
+system_prompt_length = 512 # length of each system prompt (in tokens)
 if use_system_prompt:
     output_path = output_path.replace(".jsonl", f"_sys{num_system_prompts}x{system_prompt_length}.jsonl")
 
