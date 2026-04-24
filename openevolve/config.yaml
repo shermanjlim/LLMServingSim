@@ -34,8 +34,16 @@ prompt:
     You are currently using a new type of GPU with both high-bandwidth memory (HBM)
     and high-bandwidth flash (HBF). The total amount of HBM memory (npu_mem) is 24GB while
     the total amount of HBF memory is 80GB. You are optimizing a single function,
-    `_device_allocate_policy`, which decides whether a newly allocated KV-cache block is
-    placed on NPU HBM or HBF.
+    `_device_allocate_policy`, which decides — for every newly stored KV-cache block in
+    a batch — whether it lands on NPU HBM or HBF.
+
+    The function is called once per `apply_kv_cache_events` pass with a list of
+    `BlockStored` events and the current free-byte totals on each device (already
+    reflecting any `BlockRemoved` events from the same pass). It must return one
+    `Device` decision per event, in order. Per-event `kv_bytes` is not passed in —
+    compute it as `self.get_kv(len(ev.token_ids))`. If you want per-event free
+    accounting, deduct from the local `npu_free_bytes` / `hbf_free_bytes` as you
+    place each block.
 
     =========================================================================
     SCORING — read this first
@@ -47,24 +55,25 @@ prompt:
     Steady-state refers to the period where the first and last 10% of requests are
     cut off.
 
-    Assume both HBM and HBF are saturated throughout steady state; every allocation
-    forces evictions somewhere later. The policy only chooses which side churns. An
-    "NPU-first, HBF-on-overflow" fallback is the baseline — beating it requires
-    routing blocks by their expected reuse, not just by free space.
-
     =========================================================================
     Hard constraints (violating these crashes the simulator)
     =========================================================================
-    - Return exactly `Device.NPU` or `Device.HBF`. Any other value raises.
-    - If you return Device.NPU, kv_bytes MUST be <= npu_free_bytes.
-    - If you return Device.HBF, kv_bytes MUST be <= hbf_free_bytes.
+    - Return a `list[Device]` with exactly one entry per event, in the same
+      order as `events`. Each entry must be exactly `Device.NPU` or
+      `Device.HBF`. Any other value, or a length mismatch, raises.
+    - For each event's `kv_bytes = self.get_kv(len(ev.token_ids))`:
+      if you choose Device.NPU, `kv_bytes` MUST be <= the remaining
+      `npu_free_bytes` after earlier placements in this same batch;
+      if you choose Device.HBF, `kv_bytes` MUST be <= the remaining
+      `hbf_free_bytes` after earlier placements in this same batch.
     - The scheduler normally ensures at least one side has room, but your
-      policy must still handle "preferred device full -> fall back" safely.
+      policy must still handle "preferred device full -> fall back" safely,
+      including across multiple events within a single call.
     - Do NOT change the function signature, the import, or the
       `# EVOLVE-BLOCK-START` / `# EVOLVE-BLOCK-END` markers.
     - Do NOT add module-level state, global mutation, I/O, or new imports.
-      The policy runs on every block of every request - keep it cheap and
-      deterministic from the passed signals.
+      The policy runs on every batch of blocks for every request - keep it
+      cheap and deterministic from the passed signals.
     - Read self.* freely (e.g. self.hbf_write_bytes, self.npu_used). Do NOT
       mutate self: the policy must be a pure function of its inputs. Stashing
       state on self will not persist reliably across calls or instances.
