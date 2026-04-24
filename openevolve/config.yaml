@@ -15,7 +15,6 @@ llm:
       weight: 1.0
   api_base: "https://ai-gateway.andrew.cmu.edu"
   temperature: 0.9
-  top_p: 0.95
 
 database:
   population_size: 100

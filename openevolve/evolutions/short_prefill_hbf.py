@@ -65,30 +65,15 @@ def _device_allocate_policy(self, ev, kv_bytes, npu_free_bytes, hbf_free_bytes):
         Device: exactly ``Device.NPU`` or ``Device.HBF``. Any other
         value raises a ``RuntimeError`` in the caller.
     """
-    # Safety check - ensure we can place somewhere
-    if kv_bytes > npu_free_bytes and kv_bytes > hbf_free_bytes:
-        return Device.HBF if hbf_free_bytes >= npu_free_bytes else Device.NPU
-    
-    # If only one device has space, use it
-    if kv_bytes > npu_free_bytes:
+    SHORT_PREFILL_THRESHOLD = 1024  # tokens
+
+    is_prefill_block = len(ev.full_token_ids) <= ev.num_input_tokens
+    is_short_prompt = ev.num_input_tokens <= SHORT_PREFILL_THRESHOLD
+
+    if is_prefill_block and is_short_prompt and kv_bytes <= hbf_free_bytes:
         return Device.HBF
-    if kv_bytes > hbf_free_bytes:
+
+    if kv_bytes <= npu_free_bytes:
         return Device.NPU
-    
-    # Both devices have space - decide based on reuse likelihood
-    # Calculate reuse score: hit_count + prefix depth bonus
-    prefix_depth = len(ev.full_token_ids) if ev.full_token_ids else 0
-    reuse_score = ev.hit_count + max(0, prefix_depth - 50) // 10
-    
-    # Calculate memory pressure (0.0 = empty, 1.0 = full)
-    npu_kv_capacity = self.npu_mem - self.npu_floor
-    npu_pressure = (self.npu_used - self.npu_floor) / max(1, npu_kv_capacity)
-    
-    # High reuse blocks prefer NPU, but adjust threshold based on pressure
-    reuse_threshold = 1 + int(npu_pressure * 3)
-    
-    if reuse_score >= reuse_threshold:
-        return Device.NPU
-    else:
-        return Device.HBF
+    return Device.HBF
 # EVOLVE-BLOCK-END

@@ -259,7 +259,7 @@ def main():
         assert num_instances == 1, "Steady-state metrics only support 1 instance"
         assert not enable_prefix_sharing, "Steady-state metrics do not support prefix sharing"
     REQ_CUTOFF_START = num_req * 0.20
-    REQ_CUTOFF_END = num_req * (1 - 0.01)
+    REQ_CUTOFF_END = num_req * (1 - 0.1)
     steady_state_start = None
     steady_state_end = None
     steady_state_prompt = 0

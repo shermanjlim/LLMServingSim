@@ -65,25 +65,15 @@ def _device_allocate_policy(self, ev, kv_bytes, npu_free_bytes, hbf_free_bytes):
         Device: exactly ``Device.NPU`` or ``Device.HBF``. Any other
         value raises a ``RuntimeError`` in the caller.
     """
-    # Hot blocks go to NPU
-    if ev.hit_count > 0:
-        return Device.NPU if kv_bytes <= npu_free_bytes else Device.HBF
+    # Blocks in the first half of the sequence live longer than those in
+    # the second half, so route them to HBF and keep scarce NPU HBM for
+    # the shorter-lived late blocks.
+    is_first_half = len(ev.full_token_ids) * 2 <= ev.num_output_tokens
 
-    # Cold blocks: HBF-first strategy to reduce write amplification
-    # However, if HBF is filling up (>85%), prefer NPU to preserve space for hot blocks
-    hbf_capacity = self.hbf_mem - self.hbf_floor
-    if hbf_capacity > 0:
-        hbf_util = (hbf_capacity - hbf_free_bytes) / hbf_capacity
-        # More aggressive threshold + deeper prefixes get NPU priority
-        if hbf_util > 0.85 and kv_bytes <= npu_free_bytes:
-            return Device.NPU
-        # Deep prefixes (>80 tokens, ~5 blocks) in moderate HBF pressure favor NPU
-        if hbf_util > 0.75 and len(ev.full_token_ids) > 80 and kv_bytes <= npu_free_bytes:
-            return Device.NPU
-
-    if kv_bytes <= hbf_free_bytes:
+    if is_first_half and kv_bytes <= hbf_free_bytes:
         return Device.HBF
 
-    # Fallback to NPU if HBF full
-    return Device.NPU if kv_bytes <= npu_free_bytes else Device.HBF
+    if kv_bytes <= npu_free_bytes:
+        return Device.NPU
+    return Device.HBF
 # EVOLVE-BLOCK-END
