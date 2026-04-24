@@ -419,7 +419,6 @@ class MemoryModel():
             # should lock evicted kv cache in storage (cpu/cxl)
             self.second_tier_prefix_cache.inc_lock_ref(new_last_node)
             req.cpu_last_node = new_last_node
-            self.apply_kv_cache_events()
 
     def evictable_size(self, device):
         if not self.enable_prefix_caching:
@@ -478,8 +477,6 @@ class MemoryModel():
                 self.second_tier_prefix_cache.pretty_print()
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to cache prefix cache of unfinished request to unsupported device {device}")
-        
-        self.apply_kv_cache_events()
 
     def cache_finished_req(self, req, device):
         if not self.enable_prefix_caching:
@@ -500,8 +497,6 @@ class MemoryModel():
                 self.second_tier_prefix_cache.pretty_print()
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to cache prefix cache of finished request to unsupported device {device}")
-        
-        self.apply_kv_cache_events()
 
     def evict_prefix_cache(self, bytes, device):
         if not self.enable_prefix_caching and bytes <= 0:
@@ -515,8 +510,6 @@ class MemoryModel():
             self.second_tier_prefix_cache.evict(space_needed)
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to evict prefix cache to unsupported device {device}")
-
-        self.apply_kv_cache_events()
 
     # -------------------- Prefix Cache Helpers --------------------
 
@@ -588,44 +581,23 @@ class MemoryModel():
     
     # Count load/unload events from prefix cache and update memory usage
     def apply_kv_cache_events(self):
-        # if not self.enable_prefix_caching:
-        #     return
-        npu_byte_alloc = 0
+        if not self.enable_prefix_caching:
+            return
+
+        # --- NPU prefix cache events ---
+        # Pass 1: process all BlockRemoved events first so free bytes used
+        # by the placement policy reflect any space just reclaimed.
         npu_byte_free = 0
-        hbf_byte_alloc = 0
         hbf_byte_free = 0
-        cpu_byte_alloc = 0
-        cpu_byte_free = 0
+        stored_events = []
         for ev in self.npu_prefix_cache.take_events():
             if isinstance(ev, BlockStored):
-                tlen = len(ev.token_ids)
-                h = ev.block_hash
-                if h in self._npu_cache_hashtolen:
-                    raise RuntimeError("hash collision!")
-                self._npu_cache_hashtolen[h] = tlen
-                kv_bytes = self.get_kv(tlen)
-                if self.enable_hbf_kv:
-                    npu_free = self.npu_mem - self.npu_used - (npu_byte_alloc - npu_byte_free)
-                    hbf_free = self.hbf_mem - self.hbf_used - (hbf_byte_alloc - hbf_byte_free)
-                    device = _device_allocate_policy(self, ev, kv_bytes, npu_free, hbf_free)
-                    if device == Device.NPU:
-                        npu_byte_alloc += kv_bytes
-                        self._block_hash_to_device[h] = Device.NPU
-                    elif device == Device.HBF:
-                        hbf_byte_alloc += kv_bytes
-                        self._block_hash_to_device[h] = Device.HBF
-                    else:
-                        raise RuntimeError(
-                            f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] "
-                            f"_device_allocate_policy returned {device!r}; expected Device.NPU or Device.HBF."
-                        )
-                else:
-                    npu_byte_alloc += kv_bytes
+                stored_events.append(ev)
             elif isinstance(ev, BlockRemoved):
                 h = ev.block_hash
                 tlen = self._npu_cache_hashtolen.pop(h, 0)
                 if tlen == 0:
-                    self.logger.warning("NPU prefix cache remove unknown block hash {h}")
+                    self.logger.warning(f"NPU prefix cache remove unknown block hash {h}")
                     continue
                 kv_bytes = self.get_kv(tlen)
                 if self.enable_hbf_kv:
@@ -639,14 +611,60 @@ class MemoryModel():
 
         if npu_byte_free > 0:
             self.free(npu_byte_free, Device.NPU)
-        if npu_byte_alloc > 0:
-            self.allocate(npu_byte_alloc, Device.NPU)
         if hbf_byte_free > 0:
-            self.free(hbf_byte_free, Device.HBF)                        
-        if hbf_byte_alloc > 0:
-            self.allocate(hbf_byte_alloc, Device.HBF)
+            self.free(hbf_byte_free, Device.HBF)
 
+        # Pass 2: decide placement for every BlockStored event in one call.
+        if stored_events:
+            for ev in stored_events:
+                if ev.block_hash in self._npu_cache_hashtolen:
+                    raise RuntimeError("hash collision!")
+
+            if self.enable_hbf_kv:
+                npu_free = self.npu_mem - self.npu_used
+                hbf_free = self.hbf_mem - self.hbf_used
+                decisions = _device_allocate_policy(self, stored_events, npu_free, hbf_free)
+                if len(decisions) != len(stored_events):
+                    raise RuntimeError(
+                        f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] "
+                        f"_device_allocate_policy returned {len(decisions)} decisions for "
+                        f"{len(stored_events)} events; expected one per event."
+                    )
+                npu_byte_alloc = 0
+                hbf_byte_alloc = 0
+                for ev, device in zip(stored_events, decisions):
+                    tlen = len(ev.token_ids)
+                    h = ev.block_hash
+                    self._npu_cache_hashtolen[h] = tlen
+                    kv_bytes = self.get_kv(tlen)
+                    if device == Device.NPU:
+                        npu_byte_alloc += kv_bytes
+                        self._block_hash_to_device[h] = Device.NPU
+                    elif device == Device.HBF:
+                        hbf_byte_alloc += kv_bytes
+                        self._block_hash_to_device[h] = Device.HBF
+                    else:
+                        raise RuntimeError(
+                            f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] "
+                            f"_device_allocate_policy returned {device!r}; expected Device.NPU or Device.HBF."
+                        )
+                if npu_byte_alloc > 0:
+                    self.allocate(npu_byte_alloc, Device.NPU)
+                if hbf_byte_alloc > 0:
+                    self.allocate(hbf_byte_alloc, Device.HBF)
+            else:
+                npu_byte_alloc = 0
+                for ev in stored_events:
+                    tlen = len(ev.token_ids)
+                    self._npu_cache_hashtolen[ev.block_hash] = tlen
+                    npu_byte_alloc += self.get_kv(tlen)
+                if npu_byte_alloc > 0:
+                    self.allocate(npu_byte_alloc, Device.NPU)
+
+        # --- Second-tier (CPU) prefix cache events ---
         if not self.enable_prefix_sharing and self.prefix_storage is Device.CPU:
+            cpu_byte_alloc = 0
+            cpu_byte_free = 0
             for ev in self.second_tier_prefix_cache.take_events():
                 if isinstance(ev, BlockStored):
                     tlen = len(ev.token_ids)
@@ -656,10 +674,10 @@ class MemoryModel():
                     tlen = self._cpu_cache_hashtolen.pop(ev.block_hash, 0)
                     cpu_byte_free += self.get_kv(tlen) * self.npu_num
 
-            if cpu_byte_alloc > 0:
-                self.allocate(cpu_byte_alloc, Device.CPU)
             if cpu_byte_free > 0:
                 self.free(cpu_byte_free, Device.CPU)
+            if cpu_byte_alloc > 0:
+                self.allocate(cpu_byte_alloc, Device.CPU)
 
     def return_prefix_info(self):
         if not self.enable_prefix_caching:

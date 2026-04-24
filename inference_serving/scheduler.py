@@ -54,7 +54,11 @@ class Scheduler:
  
     def schedule(self, current, sys, batch_id=-1):
         if self.enable_prefix_caching:
-            return self.schedule_with_prefix(current, sys, batch_id)
+            result = self.schedule_with_prefix(current, sys, batch_id)
+            # Apply all queued KV cache events (from cache_*/evict_* calls
+            # made during scheduling) in a single batched pass.
+            self.memory.apply_kv_cache_events()
+            return result
         else:
             return self.schedule_base(current, sys, batch_id)
 
@@ -595,6 +599,10 @@ class Scheduler:
 
         del self.inflight[idx]
         del batch
+        # Apply KV cache events queued by cache_finished_req / unlock_prefix
+        # above in a single batched pass.
+        if self.enable_prefix_caching:
+            self.memory.apply_kv_cache_events()
         return prompt_t, gen_t, end_reqs
     
 
