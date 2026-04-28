@@ -2,3 +2,6 @@
 	path = astra-sim
 	url = https://github.com/shermanjlim/astra-sim.git
 	branch = hbf
+[submodule "report"]
+	path = report
+	url = git@github.com:gulang2019/15-740_Report.git
