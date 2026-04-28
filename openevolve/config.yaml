@@ -1,4 +1,4 @@
-max_iterations: 100
+max_iterations: 200
 checkpoint_interval: 20
 
 evaluator:
