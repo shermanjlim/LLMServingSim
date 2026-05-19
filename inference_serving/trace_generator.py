@@ -14,8 +14,6 @@ from .logger import get_logger
 import numpy as np
 from math import ceil
 # import xgboost as xgb
-import sklearn
-import joblib
 import pickle
 
 # ----------------------------------------------------------------------
@@ -33,6 +31,7 @@ _attn_perf_db_cache = {}
 # ----------------------------------------------------------------------
 _attn_predictor_cache = {}
 _attn_prediction_value_cache = {}
+_attn_perf_fallback_warnings = set()
 
 logger = get_logger("TraceGenerator")
 
@@ -50,7 +49,7 @@ def generate_trace(batch, hardware, npu_num, npu_group, pd_type=None, node_id=0,
     load_size = batch.load
     evict_size = batch.evict
 
-    output_path = f"inputs/trace/{hardware}/{batch.model}/instance{instance_id}_batch{batch.batch_id}.txt"
+    output_path = f"inputs/trace/{get_workload_file_name(batch, hardware, instance_id=instance_id)}.txt"
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     # make trace
@@ -1822,7 +1821,8 @@ def generate_event(alarm):
     result.append([layer_name, comp_time, input_loc, input_size, weight_loc, weight_size, output_loc, output_size, comm_type, comm_size, misc])
 
     # write to the text file
-    output_path = f"inputs/trace/event_handler.txt"
+    output_path = f"inputs/trace/{get_workload_file_name(None, None, event=True)}.txt"
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, 'w') as f:
         f.write(f"EVENT\n")
         f.write(f'{len(result)}'+'\n') # length of the text is 1
@@ -2180,6 +2180,32 @@ def _get_attn_perf_row(perf_db, key):
     try:
         return perf_db[key]
     except KeyError:
+        if not perf_db:
+            raise KeyError(
+                f"No perf entry for key={key} in attention performance DB."
+            )
+
+        target_a, target_b = key
+        best_key = min(
+            perf_db.keys(),
+            key=lambda candidate: (
+                abs(int(candidate[0]) - int(target_a)),
+                abs(int(candidate[1]) - int(target_b)),
+                int(candidate[0]),
+                int(candidate[1]),
+            ),
+        )
+        if best_key in perf_db:
+            warning_key = (key, best_key)
+            if warning_key not in _attn_perf_fallback_warnings:
+                logger.warning(
+                    "[ATTN PERF] Missing exact key=%s; falling back to nearest available key=%s",
+                    key,
+                    best_key,
+                )
+                _attn_perf_fallback_warnings.add(warning_key)
+            return perf_db[best_key]
+
         raise KeyError(
             f"No perf entry for key={key} in attention performance DB."
         )
@@ -2216,6 +2242,14 @@ def _load_attn_predictor(hardware: str, model: str, tp: int):
     cache_key = (hardware, model, tp)
     if cache_key in _attn_predictor_cache:
         return _attn_predictor_cache[cache_key]
+
+    try:
+        import joblib
+    except Exception as e:
+        raise RuntimeError(
+            "Attention prediction dependencies are unavailable. "
+            "Disable --enable-attn-prediction or install a compatible joblib/sklearn/scipy stack."
+        ) from e
 
     base_dir = "../llm_profile/perf_models"
     model_dir = os.path.join(base_dir, hardware, model, f"tp{tp}")

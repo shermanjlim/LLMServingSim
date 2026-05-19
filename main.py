@@ -51,16 +51,30 @@ def main():
     parser.add_argument('--enable-attn-prediction', action='store_true', help="enable realtime attention prediction", default=False)
     parser.add_argument('--prioritize-prefill', action='store_true', help="prioritize prefill", default=False)
     parser.add_argument('--block-size', type=int, help='kv cache block size unit of tokens', default=16)
-    parser.add_argument('--dataset', type=str, help='dataset path', default=None)
+    parser.add_argument('--dataset', type=str, help='dataset path or synthetic spec ARRIVAL:LENGTH', default=None)
+    parser.add_argument('--load-scale', '--load_scale', dest='load_scale', type=float, help='arrival load scaling factor for synthetic ARRIVAL:LENGTH datasets', default=1.0)
+    parser.add_argument('--rps', type=float, help='absolute arrival rate in requests/s for synthetic ARRIVAL:LENGTH datasets; overrides --load-scale', default=None)
+    parser.add_argument('--window', type=str, help='dataset window: START:END for request indices, or tSTART:END for arrival-time range', default=None)
     parser.add_argument('--output', type=str, help='output path', default=None)
     parser.add_argument('--gen', action='store_false', default=True, help='skip initiation phase')
-    parser.add_argument('--num-req', type=int, help='number of requests to use', default=100)
+    parser.add_argument('--num-req', type=int, help='number of requests to use; defaults to all requests after dataset/window filtering', default=None)
     parser.add_argument('--log-interval', type=float, help='interval to log throughput (sec)', default=0.5)
+    parser.add_argument('--steady-min-s', type=float, help='warmup duration in seconds before resetting profiling counters and starting measurement', default=None)
+    parser.add_argument('--steady-window', type=float, help='profiling window duration in seconds collected after --steady-min-s, then exit early', default=None)
     parser.add_argument('--log-level', type=str, choices=['WARNING', 'INFO', 'DEBUG'], help='log level to use', default='WARNING')
     parser.add_argument('--network-backend', type=str, choices=['analytical', 'ns3'], help='network backend to use', default='analytical')
     parser.add_argument('--metrics-output', type=str, help='output path for metrics at steady-state', default=None)
 
     args = parser.parse_args()
+    requested_load_scale = args.load_scale
+    resolved_native_rps = None
+    if args.rps is not None:
+        probe_router = Router(0, [], None, args.request_routing_policy)
+        args.load_scale, resolved_native_rps = probe_router.resolve_load_scale(
+            args.dataset,
+            load_scale=args.load_scale,
+            rps=args.rps,
+        )
 
     print_logo()
     print_input_config(args=args)
@@ -69,6 +83,20 @@ def main():
 
     configure_logger(level=args.log_level)
     logger = get_logger("Main")
+    if args.rps is not None:
+        if requested_load_scale != 1.0:
+            logger.warning(
+                "--rps=%.4f overrides --load-scale=%.4f for synthetic dataset '%s'.",
+                args.rps,
+                requested_load_scale,
+                args.dataset,
+            )
+        logger.info(
+            "Resolved --rps=%.4f requests/s against native arrival rate %.4f requests/s using load_scale=%.6f.",
+            args.rps,
+            resolved_native_rps,
+            args.load_scale,
+        )
     
     max_batch=args.max_batch if args.max_batch != 0 else float('inf')
     max_num_batched_tokens=args.max_num_batched_tokens if args.max_num_batched_tokens != 0 else float('inf')
@@ -93,12 +121,46 @@ def main():
         )
     prioritize_prefill=args.prioritize_prefill
     dataset=args.dataset
+    load_scale=args.load_scale
+    window=args.window
     output_file=args.output
     is_init=args.gen
-    num_req=args.num_req
+    requested_num_req=args.num_req
     log_interval=args.log_interval
     network_backend = args.network_backend
+    num_req = requested_num_req
+    steady_min_s = args.steady_min_s
+    steady_window_s = args.steady_window
     metrics_output_file = args.metrics_output
+    if (steady_min_s is None) != (steady_window_s is None):
+        raise ValueError("--steady-min-s and --steady-window must be provided together")
+    if steady_min_s is not None:
+        if steady_min_s < 0:
+            raise ValueError("--steady-min-s must be >= 0")
+        if steady_window_s <= 0:
+            raise ValueError("--steady-window must be > 0")
+    if dataset is not None:
+        probe_router = Router(0, [], None, request_routing_policy)
+        available_num_req = probe_router.count_dataset_rows(
+            dataset,
+            load_scale=load_scale,
+            window=window,
+        )
+        if available_num_req == 0:
+            raise ValueError(f"No requests remain after applying dataset filters to '{dataset}'")
+        if requested_num_req is None:
+            num_req = available_num_req
+        else:
+            num_req = min(requested_num_req, available_num_req)
+            if num_req < requested_num_req:
+                logger.warning(
+                    "Requested --num-req=%d but only %d requests remain after dataset/window filtering. Using %d.",
+                    requested_num_req,
+                    available_num_req,
+                    num_req,
+                )
+    elif num_req is None:
+        num_req = 100
     # ---------------------------------- Extract cluster config -----------------------------------
     cluster = build_cluster_config(astra_sim, args.cluster_config, args.enable_local_offloading, args.enable_attn_offloading, enable_hbf_offloading, enable_hbf_kv)
     num_nodes = cluster["num_nodes"]
@@ -222,7 +284,13 @@ def main():
 
     # If there is no instance id, all requests are copied and added to each instance
     if dataset != None:
-        router.generate(dataset, enable_prefix_caching=enable_prefix_caching, is_init=is_init)
+        router.generate(
+            dataset,
+            enable_prefix_caching=enable_prefix_caching,
+            is_init=is_init,
+            load_scale=load_scale,
+            window=window,
+        )
     else:
         # Manually adding request
         for i in range(16):      # seq_len, end_len, arrival_time, instance_id
@@ -253,6 +321,77 @@ def main():
     total_gen = 0
     total_latency = 0
     req_cnt = 0
+    steady_profile_enabled = steady_min_s is not None
+    steady_start_ns = int(steady_min_s * FREQ) if steady_profile_enabled else None
+    steady_window_ns = int(steady_window_s * FREQ) if steady_profile_enabled else None
+    steady_end_ns = steady_start_ns + steady_window_ns if steady_profile_enabled else None
+    profiling_started = False
+    profiling_end_reason = None
+    profiled_start_ns = 0
+    profiled_end_ns = 0
+
+    def reset_power_window(window_start_ns):
+        if not power_modeling or power_model is None:
+            return
+        window_start_s = window_start_ns * 1e-9
+        power_model.net_energies = [
+            {key: 0 for key in node_energy}
+            for node_energy in power_model.net_energies
+        ]
+        power_model.last_time_ns = window_start_ns
+        power_model.last_energies = [
+            sum(power_model.base_powers[node_id].values()) * window_start_s
+            for node_id in range(power_model.num_nodes)
+        ]
+        power_model.total_energies = [0 for _ in range(power_model.num_nodes)]
+        power_model.power_time_series = []
+        power_model.total_system_energy = 0
+        power_model.end_time_s = 0
+        power_model.cpu_log = 0
+        power_model.npu_log = 0
+        power_model.dram_log = 0
+        power_model.link_log = 0
+        power_model.standby_log = 0
+
+    def start_steady_window(window_start_ns):
+        nonlocal throughput, prompt_th, gen_th, last_log
+        nonlocal total_prompt, total_gen, req_cnt
+        nonlocal profiling_started, profiled_start_ns, profiled_end_ns
+
+        throughput = []
+        prompt_th = 0
+        gen_th = 0
+        last_log = window_start_ns
+        total_prompt = 0
+        total_gen = 0
+        req_cnt = 0
+        profiled_start_ns = window_start_ns
+        profiled_end_ns = window_start_ns
+        profiling_started = True
+
+        for scheduler in schedulers:
+            scheduler.done = []
+            scheduler.memory.hbf_write_count = 0
+            scheduler.memory.hbf_write_bytes = 0
+
+        if power_modeling:
+            reset_power_window(window_start_ns)
+            for inst_idx in range(num_instances):
+                last_end_time[inst_idx] = window_start_ns
+                last_calc_time[inst_idx] = window_start_ns
+
+        print(SINGLE_BAR)
+        print(
+            bold(
+                cyan(
+                    f"▶ Starting steady-state profiling window [{window_start_ns / FREQ:.3f}s, {steady_end_ns / FREQ:.3f}s)...\n"
+                )
+            )
+        )
+        flush.stdout.flush()
+
+    def safe_rate(numerator, denominator):
+        return numerator / denominator if denominator > 0 else 0.0
 
     # introduces a cutoff to only measure metrics at steady-state
     if metrics_output_file is not None:
@@ -307,6 +446,17 @@ def main():
             id = out_dict['id']
             current = out_dict['cycle']
 
+        if steady_profile_enabled and not profiling_started and current >= steady_start_ns:
+            start_steady_window(steady_start_ns)
+
+        if steady_profile_enabled and profiling_started and current >= steady_end_ns:
+            profiling_end_reason = "steady_window_complete"
+            profiled_end_ns = steady_end_ns
+            print(SINGLE_BAR)
+            print(bold(cyan("▶ Exiting simulation at steady-state profiling window end...\n")))
+            controller.write_flush(p, "exit")
+            break
+
         instance_id = npu2inst_mapping[sys]  # get instance id from NPU id
         node_id = inst2node_mapping[instance_id] # get node id from instance id
 
@@ -324,12 +474,15 @@ def main():
         # check request is done
         prompt_t, gen_t, reqs = schedulers[instance_id].add_done(id, sys, current)
         # add tokens in throughput
-        prompt_th += prompt_t
-        total_prompt += prompt_t
-        gen_th += gen_t
-        total_gen += gen_t
-        # count only finished requests
-        req_cnt += len(reqs) if instances[instance_id]["pd_type"] != "prefill" else 0
+        should_collect = (not steady_profile_enabled) or profiling_started
+        if should_collect:
+            prompt_th += prompt_t
+            total_prompt += prompt_t
+            gen_th += gen_t
+            total_gen += gen_t
+            profiled_end_ns = current
+            # count only finished requests
+            req_cnt += len(reqs) if instances[instance_id]["pd_type"] != "prefill" else 0
 
         # capture metrics at steady-state
         if req_cnt > REQ_CUTOFF_START and req_cnt < REQ_CUTOFF_END:
@@ -377,9 +530,10 @@ def main():
             controller.write_flush(p, workload)
 
         # check time to store throughput
-        if current > last_log + INTERVAL:
+        if (not steady_profile_enabled or profiling_started) and current > last_log + INTERVAL:
             # store the prompt
-            throughput.append((prompt_th*RATIO, gen_th*RATIO))
+            if should_collect:
+                throughput.append((prompt_th*RATIO, gen_th*RATIO))
             last_log += INTERVAL
             log_time_str = f"[{last_log / FREQ:.1f}s]"
             log_time_len = len(log_time_str)
@@ -397,14 +551,23 @@ def main():
             ######### Per Instance Metrics #########
 
             for inst_id in range(num_instances):
-                running_reqs = sum([len(batch.requests) for batch in schedulers[inst_id].inflight] + [len([req for req in schedulers[inst_id].request if req.arrival <= current])])
+                inflight_reqs = sum(len(batch.requests) for batch in schedulers[inst_id].inflight)
+                arrived_queued_reqs = len([req for req in schedulers[inst_id].request if req.arrival <= current])
+                finished_reqs = len(schedulers[inst_id].done)
+                total_reqs = len(schedulers[inst_id].request) + inflight_reqs + finished_reqs
+                arrived_reqs = arrived_queued_reqs + inflight_reqs + finished_reqs
+                active_reqs = arrived_queued_reqs + inflight_reqs
                 
                 mem = schedulers[inst_id].memory
                 npu_used_mb = mem.npu_used / MB_TO_BYTE
                 npu_cap_mb = mem.npu_mem / MB_TO_BYTE if mem.npu_mem else 0.0
                 npu_util = (mem.npu_used / mem.npu_mem * 100.0) if mem.npu_mem else 0.0
             
-                print(f"{log_indent+tree_indent}Running Instance[{inst_id}]: {running_reqs} reqs,", end=' ')
+                print(
+                    f"{log_indent+tree_indent}Running Instance[{inst_id}]: "
+                    f"total={total_reqs}, arrived={arrived_reqs}, finished={finished_reqs}, active={active_reqs},",
+                    end=' '
+                )
                 print(f"Total # {schedulers[inst_id].npu_num} NPUs, Each NPU Memory Usage {npu_used_mb:.2f} MB ({npu_util:.3f} % Used)", end='')
                 if mem.hbf_mem > 0:
                     hbf_used_mb = mem.hbf_used / MB_TO_BYTE
@@ -496,6 +659,8 @@ def main():
                 print(SINGLE_BAR)
                 print(bold(cyan("▶ Exiting simulation...\n")))
                 controller.write_flush(p, "exit")
+                if profiling_started:
+                    profiled_end_ns = current
                 break
 
             controller.write_flush(p, "done") # make done instances to sleep
@@ -534,22 +699,38 @@ def main():
                 total_cpu_hit_tokens += temp_cpu_b
     
     # This is total system's throughput
-    total_latency = current/FREQ
+    if steady_profile_enabled:
+        if profiling_started:
+            total_latency = max(profiled_end_ns - profiled_start_ns, 0) / FREQ
+        else:
+            total_latency = 0
+    else:
+        total_latency = current/FREQ
     print(SINGLE_BAR)
     print(bold(cyan("▶ Simulation results...\n")))
     print(f"Total simulation time: {int(hours)}h {int(minutes)}m {seconds:.3f}s")
+    if steady_profile_enabled:
+        if profiling_started:
+            print(
+                f"Profiled steady-state window (s):                                   "
+                f"{profiled_start_ns / FREQ:.3f}:{profiled_end_ns / FREQ:.3f}"
+            )
+            if profiling_end_reason == "steady_window_complete":
+                print(f"Requested steady-state window (s):                                  {steady_min_s:.3f}:{steady_min_s + steady_window_s:.3f}")
+        else:
+            print("Profiled steady-state window (s):                                   not reached")
     print(SINGLE_BAR)
     print(magenta(center('Throughput Results')))
     print(SINGLE_BAR)
     print(f"Total requests:                                                     {req_cnt}")
-    print(f"Total clocks (ns):                                                  {current}")
+    print(f"Total clocks (ns):                                                  {int(total_latency * FREQ)}")
     print(f"Total latency (s):                                                  {total_latency:.3f}")
     print(f"Total input tokens:                                                 {total_prompt}")
     print(f"Total generated tokens:                                             {total_gen}")
-    print(f"Request throughput (req/s):                                         {req_cnt/total_latency:.2f}")
-    print(f"Average prompt throughput (tok/s):                                  {total_prompt/total_latency:.2f}")
-    print(f"Average generation throughput (tok/s):                              {total_gen/total_latency:.2f}")
-    print(f"Total token throughput (tok/s):                                     {(total_prompt + total_gen)/total_latency:.2f}")
+    print(f"Request throughput (req/s):                                         {safe_rate(req_cnt, total_latency):.2f}")
+    print(f"Average prompt throughput (tok/s):                                  {safe_rate(total_prompt, total_latency):.2f}")
+    print(f"Average generation throughput (tok/s):                              {safe_rate(total_gen, total_latency):.2f}")
+    print(f"Total token throughput (tok/s):                                     {safe_rate(total_prompt + total_gen, total_latency):.2f}")
     print(f"Throughput per {1/RATIO} sec: {throughput}")
     print(SINGLE_BAR)
     if enable_prefix_caching:
@@ -566,7 +747,8 @@ def main():
     if power_modeling:
         print(magenta(center("Power Modeling Results")))
         print(SINGLE_BAR)
-        total_energy = power_model.get_final_energy(current)
+        power_end_ns = int(total_latency * FREQ) if steady_profile_enabled and profiling_started else current
+        total_energy = power_model.get_final_energy(power_end_ns)
         print(f"Total energy consumption (kJ):                                      {total_energy/1000:.2f}")
         # Each node results
         power_model.print_power_summary()
